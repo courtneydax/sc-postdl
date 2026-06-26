@@ -28,3 +28,12 @@ Based on the original [XenForo Post Downloader](https://github.com/SkyCloudDev/F
 ## Usage
 
 Navigate to any SimpCity thread and use the download button added by the script.
+
+## Large file downloads
+
+Files above a certain size are handed off to the browser's native downloader (e.g. Chrome download list) instead of the in-page downloader. This is slower but more stable for large files. Thresholds by host:
+
+| Host | Threshold |
+|---|---|
+| Bunkr | 500 MB |
+| GoFile / Pixeldrain / Filester | 1.6 GB |
