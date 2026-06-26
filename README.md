@@ -22,7 +22,8 @@ Based on the original [XenForo Post Downloader](https://github.com/SkyCloudDev/F
 .iso
 /\.(zip|tgz|tar|bin)$/
 /\.r(ar|[0-9]{2,2})$/
-.rss```
+.rss
+```
 
 ## Usage
 
