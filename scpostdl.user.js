@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.m01
+// @version 3.18.m03
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -877,7 +877,7 @@ const h = {
                     responseType,
                     data,
                     headers: hdrs,
-                    ...(withCredentials ? { withCredentials: true, courtneydaxymous: false } : {}),
+                    ...(withCredentials ? { withCredentials: true, anonymous: false } : {}),
                     onreadystatechange: response => {
                         if (response.readyState === 2) {
                             responseHeaders = response.responseHeaders;
@@ -2050,7 +2050,7 @@ const xfpdGmGetText = (getUrl, headers, timeoutMs) => new Promise(resolve => {
             url: String(getUrl),
             headers: headers || {},
             responseType: 'text',
-            courtneydaxymous: false,
+            anonymous: false,
             timeout: Number(timeoutMs) || 0,
             onload: r => resolve({ ok: true, status: r.status || 0, text: String(r.responseText || r.response || '') }),
             onerror: () => resolve({ ok: false, status: 0, text: '' }),
@@ -3040,7 +3040,7 @@ if (page === 1) {
 
         const getAccountToken = async (force = false) => {
             // If the user provided a personal Bearer token, always use it.
-            // (This is optional; leaving it empty keeps the courtneydaxymous account-token flow.)
+            // (This is optional; leaving it empty keeps the anonymous account-token flow.)
             try {
                 const override = settings?.hosts?.goFile?.bearerOverride;
                 if (override && String(override).trim() !== '') {
@@ -4006,7 +4006,7 @@ if (page === 1) {
                             url: String(reqUrl),
                             headers: hdrs || {},
                             responseType: 'text',
-                            courtneydaxymous: false,
+                            anonymous: false,
                             timeout: 6000,
                             onload: r => resolve({ status: r.status || 0, source: String(r.responseText || r.response || '') }),
                             onerror: () => resolve({ status: 0, source: '' }),
@@ -5968,6 +5968,7 @@ if (tmp.length) {
             const CYBERDROP_WARMUP_MS = 1500;
 
             const BLOB_MAX_BYTES = Math.floor(1.6 * 1024 * 1024 * 1024);
+            const BUNKR_DIRECT_MIN_BYTES = 500 * 1024 * 1024;
             const preflightMetaCache = new Map();
             // Windows-safe filenames for GM_download (Chrome is stricter than Firefox).
             const WIN_ILLEGAL_RE = /[<>:"\/\\|?*\x00-\x1F]/g;
@@ -6688,7 +6689,7 @@ if (tmp.length) {
                                                     method: 'GET',
                                                     url: String(cand),
                                                     responseType: 'text',
-                                                    courtneydaxymous: false,
+                                                    anonymous: false,
                                                     withCredentials: true,
                                                     timeout: 5000,
                                                     headers: { Range: 'bytes=0-0', Accept: '*/*', Referer: ref },
@@ -6784,7 +6785,7 @@ if (imagebamHeaders && isFF) {
                                     url,
                                     headers: imagebamHeaders,
                                     responseType: 'blob',
-                                    courtneydaxymous: false,
+                                    anonymous: false,
                                     timeout: 60000,
                                     onprogress: dlOpts.onprogress,
                                     onload: r => {
@@ -6829,7 +6830,7 @@ if (imagebamHeaders && isFF) {
                                                 method: 'GET',
                                                 url: String(dlOpts.url),
                                                 responseType: 'text',
-                                                courtneydaxymous: false,
+                                                anonymous: false,
                                                 withCredentials: true,
                                                 timeout: 15000,
                                                 headers: { Range: 'bytes=0-0', Accept: '*/*', Referer: ref },
@@ -6895,7 +6896,7 @@ if (isGoFile || isPixeldrain || isFilester) {
                     url,
                     headers: reqHeaders,
                     responseType: 'blob',
-                    courtneydaxymous: false,
+                    anonymous: false,
                     ...(isFilester ? { withCredentials: true } : {}),
                     onreadystatechange: response => {
                         if (response.readyState === 2) {
@@ -6928,6 +6929,14 @@ if (isGoFile || isPixeldrain || isFilester) {
                         // Pixeldrain/GoFile: if size only becomes known mid-download and it's > ~1.6GB, switch to direct download.
                         if (!switchedToDirect && (isGoFile || isPixeldrain || isFilester) && response && response.total && response.total > BLOB_MAX_BYTES) {
                             log.post.info(postId, `::Large file (${response.total} bytes > ~1.6GB) detected -> switch to DIRECT::: ${url}`, postNumber);
+                            switchedToDirect = true;
+                            try { request.abort(); } catch (e) {}
+                            startDirectDownload({ size: response.total });
+                            return;
+                        }
+                        // Bunkr: large videos cause MV3 port disconnection via blob; switch to direct download above 500MB.
+                        if (!switchedToDirect && isBunkr && response && response.total && response.total > BUNKR_DIRECT_MIN_BYTES) {
+                            log.post.info(postId, `::Bunkr large file (${response.total} bytes > 500MB) -> switch to DIRECT::: ${url}`, postNumber);
                             switchedToDirect = true;
                             try { request.abort(); } catch (e) {}
                             startDirectDownload({ size: response.total });
