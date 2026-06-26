@@ -5,7 +5,7 @@
 // @author SkyCloudDev
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b01
+// @version 3.18.b02
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
