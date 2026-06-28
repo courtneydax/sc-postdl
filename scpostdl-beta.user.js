@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b05
+// @version 3.18.b06
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -2245,9 +2245,19 @@ const resolvers = [
         [/goonbox\.cr\/img\//],
         async (url, http) => {
             const id = url.split('/').pop().split('?')[0];
-            const { source } = await http.get(`https://goonbox.cr/api/images/${id}`, {}, {}, 'text');
-            const data = JSON.parse(source);
-            return data?.image?.original_url;
+            const { source } = await http.get(
+                `https://goonbox.cr/api/images/${id}`,
+                {},
+                { Referer: url, Accept: 'application/json' },
+                'text',
+            );
+            if (!source) return null;
+            try {
+                const data = JSON.parse(source);
+                return data?.image?.original_url || null;
+            } catch (e) {
+                return null;
+            }
         },
     ],
     [
