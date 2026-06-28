@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b06
+// @version 3.18.b07
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -7714,9 +7714,15 @@ return;
         log.post.info(postId, '::Skipping download::', postNumber);
     }
 
-    h.hide(statusLabel);
     h.hide(filePB);
     h.hide(totalPB);
+    if (completed < totalResources) {
+        h.ui.setElProps(statusLabel, { color: '#e8a838', fontWeight: 'bold' });
+        h.ui.setText(statusLabel, `${completed} / ${totalResources} downloaded`);
+        h.show(statusLabel);
+    } else {
+        h.hide(statusLabel);
+    }
 
     if (totalDownloadable > 0) {
         let title = sanitizeWinSegment(threadTitle);
