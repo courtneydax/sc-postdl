@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b04
+// @version 3.18.b05
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -1067,10 +1067,11 @@ const parsers = {
                 messageContentClone.querySelectorAll('a[href*="/attachments/"] img').forEach((img) => img.remove());
             } catch (e) { /* ignore */ }
 
-            // Goonbox links wrap a JPGX CDN thumbnail — suppress it so we resolve the full-res via the page instead.
+            // Goonbox links wrap a medium-res CDN thumbnail — suppress it so we call the API for the original instead.
             try {
                 messageContentClone.querySelectorAll('a[href*="goonbox.cr"] img').forEach((img) => img.remove());
             } catch (e) { /* ignore */ }
+
 
 
             // Decode forum outbound link protection (e.g. /redirect/?to=...&m=b64) for parsing only.
@@ -2243,8 +2244,10 @@ const resolvers = [
     [
         [/goonbox\.cr\/img\//],
         async (url, http) => {
-            const { dom } = await http.get(url);
-            return dom.querySelector('a[download]')?.getAttribute('href');
+            const id = url.split('/').pop().split('?')[0];
+            const { source } = await http.get(`https://goonbox.cr/api/images/${id}`, {}, {}, 'text');
+            const data = JSON.parse(source);
+            return data?.image?.original_url;
         },
     ],
     [
