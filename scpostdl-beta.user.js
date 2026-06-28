@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b03
+// @version 3.18.b04
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -113,6 +113,7 @@
 // @connect phncdn.com
 // @connect xvideos.com
 // @connect give.xxx
+// @connect goonbox.cr
 // @connect githubusercontent.com
 // @connect filester.me
 // @connect filester.sh
@@ -1066,6 +1067,11 @@ const parsers = {
                 messageContentClone.querySelectorAll('a[href*="/attachments/"] img').forEach((img) => img.remove());
             } catch (e) { /* ignore */ }
 
+            // Goonbox links wrap a JPGX CDN thumbnail — suppress it so we resolve the full-res via the page instead.
+            try {
+                messageContentClone.querySelectorAll('a[href*="goonbox.cr"] img').forEach((img) => img.remove());
+            } catch (e) { /* ignore */ }
+
 
             // Decode forum outbound link protection (e.g. /redirect/?to=...&m=b64) for parsing only.
             // Some forums wrap external URLs in a redirect/proxy URL and store the real target in query params
@@ -1976,6 +1982,7 @@ const hosts = [
     ['Coomer:Profiles', [/coomer.st\/[~an@._-]+\/user/]],
     ['Coomer:image', [/(\w+\.)?coomer.st\/(data|thumbnail)/]],
     ['JPGX:image', [/(simp\d+\.)?(cuckcapital\.cr|jpg\d?\.(church|fish|fishing|pet|su|cr))\/(?!(img\/|a\/|album\/))/, /jpe?g\d\.(church|fish|fishing|pet|su|cr)(\/a\/|\/album\/)[~an@-_.]+<no_qs>/]],
+    ['Goonbox:image', [/goonbox\.cr\/img\//]],
     ['kemono:direct link', [/.{2,6}\.kemono.cr\/data\//]],
     ['Postimg:image', [/!!https?:\/\/(www.)?i\.?(postimg|pixxxels).cc\/(.{8})/]], //[/!!https?:\/\/(www.)?postimg.cc\/(.{8})/]],
     ['Ibb:image',
@@ -2233,6 +2240,13 @@ const resolvers = [
         },
     ],
     [[/kemono.cr\/data/], url => url],
+    [
+        [/goonbox\.cr\/img\//],
+        async (url, http) => {
+            const { dom } = await http.get(url);
+            return dom.querySelector('a[download]')?.getAttribute('href');
+        },
+    ],
     [
         [/(jpg\d\.(church|fish|fishing|pet|su|cr))|cuckcapital\.cr\//i, /:!jpe?g\d\.(church|fish|fishing|pet|su|cr)(\/a\/|\/album\/)/i],
         url =>
