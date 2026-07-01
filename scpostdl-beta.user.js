@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.18.b07
+// @version 3.18.b08
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -1983,7 +1983,7 @@ const hosts = [
     ['Coomer:Profiles', [/coomer.st\/[~an@._-]+\/user/]],
     ['Coomer:image', [/(\w+\.)?coomer.st\/(data|thumbnail)/]],
     ['JPGX:image', [/(simp\d+\.)?(cuckcapital\.cr|jpg\d?\.(church|fish|fishing|pet|su|cr))\/(?!(img\/|a\/|album\/))/, /jpe?g\d\.(church|fish|fishing|pet|su|cr)(\/a\/|\/album\/)[~an@-_.]+<no_qs>/]],
-    ['Goonbox:image', [/goonbox\.cr\/img\//]],
+    ['Goonbox:image', [/goonbox\.cr\/img\//, /goonbox\.cr\/a\//]],
     ['kemono:direct link', [/.{2,6}\.kemono.cr\/data\//]],
     ['Postimg:image', [/!!https?:\/\/(www.)?i\.?(postimg|pixxxels).cc\/(.{8})/]], //[/!!https?:\/\/(www.)?postimg.cc\/(.{8})/]],
     ['Ibb:image',
@@ -2258,6 +2258,45 @@ const resolvers = [
             } catch (e) {
                 return null;
             }
+        },
+    ],
+    [
+        [/goonbox\.cr\/a\//],
+        async (url, http) => {
+            const albumSlug = url.replace(/\?.*/, '').split('/').filter(Boolean).pop();
+
+            const fetchPage = async page => {
+                const { source } = await http.get(
+                    `https://goonbox.cr/api/albums/${albumSlug}/images?page=${page}`,
+                    {},
+                    { Referer: url, Accept: 'application/json' },
+                    'text',
+                );
+                if (!source) return null;
+                try {
+                    return JSON.parse(source);
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            const first = await fetchPage(1);
+            if (!first || !h.isArray(first.images)) return null;
+
+            const resolved = first.images.map(img => img.original_url).filter(Boolean);
+            const lastPage = first.pagination?.last_page || 1;
+
+            for (let page = 2; page <= lastPage; page++) {
+                const data = await fetchPage(page);
+                if (data && h.isArray(data.images)) {
+                    resolved.push(...data.images.map(img => img.original_url).filter(Boolean));
+                }
+            }
+
+            return {
+                folderName: `goonbox_${albumSlug}`,
+                resolved,
+            };
         },
     ],
     [
