@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b01
+// @version 3.20.b02
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -3067,37 +3067,57 @@ if (page === 1) {
             return await http.base(method, url, {}, headers, data, responseType);
         };
 
-        const getWebsiteToken = async (force = false) => {
+        // GoFile no longer uses the static appdata.wt from config.js for /contents.
+        // The website now derives a per-request X-Website-Token from the account token
+        // via generateWT() in https://gofile.io/dist/js/wt.obf.js, i.e.:
+        //   WT = sha256(navigator.userAgent + "::" + navigator.language + "::" + token + "::<salt1>::<salt2>")
+        // The two salts rotate whenever GoFile updates wt.obf.js, so we fetch that
+        // script live, eval it in a scoped Function (it only reads navigator, and the
+        // function declaration stays local, not leaked to global), and cache the source
+        // for a day. WT must be computed with the same UA/language the request is sent
+        // with; the language is also echoed back to the server via the X-BL header.
+        let cachedGenerateWT = null;
+
+        const getGenerateWT = async (force = false) => {
+            if (!force && cachedGenerateWT) return cachedGenerateWT;
+
             const now = Date.now();
             const cached = gmGet(WT_KEY, null);
+            let src =
+                !force && cached && cached.src && cached.ts && now - cached.ts < WT_MAX_AGE_MS
+                    ? cached.src
+                    : null;
 
-            if (!force && cached && cached.value && cached.ts && now - cached.ts < WT_MAX_AGE_MS) {
-                return cached.value;
+            if (!src) {
+                const { source } = await gmReq('GET', 'https://gofile.io/dist/js/wt.obf.js', null, {}, 'text');
+                src = source || '';
+                if (!src || !/generateWT/.test(src)) {
+                    throw new Error('Could not fetch GoFile wt.obf.js (generateWT).');
+                }
+                gmSet(WT_KEY, { src, ts: now });
             }
 
-            const candidates = ['https://gofile.io/dist/js/config.js', 'https://gofile.io/dist/js/alljs.js'];
-
-            for (const u of candidates) {
-                try {
-                    const { source } = await gmReq('GET', u, null, {}, 'text');
-                    const txt = source || '';
-
-                    const m =
-                        txt.match(/\bwt\s*=\s*"([^"]+)"/) ||
-                        txt.match(/fetchData\.wt\s*=\s*"([^"]+)"/) ||
-                        txt.match(/"wt"\s*:\s*"([^"]+)"/);
-
-                    if (m && m[1]) {
-                        gmSet(WT_KEY, { value: m[1], ts: now });
-                        return m[1];
-                    }
-                } catch (e) {}
+            try {
+                const factory = new Function(
+                    'navigator',
+                    `${src}\nreturn (typeof generateWT === 'function') ? generateWT : null;`,
+                );
+                const fn = factory(navigator);
+                if (typeof fn !== 'function') throw new Error('no generateWT');
+                cachedGenerateWT = fn;
+                return fn;
+            } catch (e) {
+                throw new Error('Could not evaluate GoFile generateWT().');
             }
-
-            throw new Error('Could not extract GoFile website token (WT).');
         };
 
-        const createAccountToken = async wt => {
+        const computeWebsiteToken = async (token, force = false) => {
+            const gen = await getGenerateWT(force);
+            return gen(token);
+        };
+
+        const createAccountToken = async () => {
+            // Live site creates the guest account with a plain POST (no website-token).
             const { source } = await gmReq(
                 'POST',
                 'https://api.gofile.io/accounts',
@@ -3105,7 +3125,6 @@ if (page === 1) {
                 {
                     accept: 'application/json',
                     'content-type': 'application/json',
-                    'x-website-token': wt,
                 },
                 'text',
             );
@@ -3117,6 +3136,18 @@ if (page === 1) {
             }
 
             const token = json.data.token;
+
+            // Sync/activate the fresh guest token server-side. The website does this via
+            // GET /accounts/website before it will resolve /contents for that token.
+            try {
+                await gmReq(
+                    'GET',
+                    'https://api.gofile.io/accounts/website',
+                    null,
+                    { accept: 'application/json', authorization: `Bearer ${token}` },
+                    'text',
+                );
+            } catch (e) {}
 
             try {
                 settings.hosts.goFile.token = token;
@@ -3152,13 +3183,22 @@ if (page === 1) {
                 }
             } catch (e) {}
 
-            const wt = await getWebsiteToken(false);
-            return await createAccountToken(wt);
+            return await createAccountToken();
         };
 
-        const apiContentsRaw = async (contentId, passwordHash, wt, token) => {
-            let apiUrl = `https://api.gofile.io/contents/${encodeURIComponent(contentId)}`;
-            if (passwordHash) apiUrl += `?password=${encodeURIComponent(passwordHash)}`;
+        const apiContentsRaw = async (contentId, passwordHash, token) => {
+            const wt = await computeWebsiteToken(token);
+
+            // Match the website's getContent() query shape (pagination + sort) exactly.
+            const params = [
+                'contentFilter=',
+                'page=1',
+                'pageSize=1000',
+                'sortField=createTime',
+                'sortDirection=-1',
+            ];
+            if (passwordHash) params.push(`password=${encodeURIComponent(passwordHash)}`);
+            const apiUrl = `https://api.gofile.io/contents/${encodeURIComponent(contentId)}?${params.join('&')}`;
 
             const { source } = await gmReq(
                 'GET',
@@ -3168,6 +3208,7 @@ if (page === 1) {
                     accept: 'application/json',
                     authorization: `Bearer ${token}`,
                     'x-website-token': wt,
+                    'x-bl': (typeof navigator !== 'undefined' && navigator.language) || '',
                 },
                 'text',
             );
@@ -3176,18 +3217,18 @@ if (page === 1) {
         };
 
         const apiContents = async (contentId, passwordHash) => {
-            let wt = await getWebsiteToken(false);
             let token = await getAccountToken(false);
 
-            let json = await apiContentsRaw(contentId, passwordHash, wt, token);
+            let json = await apiContentsRaw(contentId, passwordHash, token);
             if (json && json.status === 'ok') return json;
 
             const s = String(json?.status || json?.message || '').toLowerCase();
 
             if (s.includes('unauthorized') || s.includes('token') || s.includes('invalid')) {
-                wt = await getWebsiteToken(true);
+                // Refresh both the salts (wt.obf.js may have rotated) and the guest token.
+                await getGenerateWT(true);
                 token = await getAccountToken(true);
-                json = await apiContentsRaw(contentId, passwordHash, wt, token);
+                json = await apiContentsRaw(contentId, passwordHash, token);
                 return json;
             }
 
