@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b02
+// @version 3.20.b03
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -126,6 +126,7 @@
 // @grant GM_getValue
 // @grant GM_log
 // @grant GM_openInTab
+// @grant GM_cookie
 
 // ==/UserScript==
 // --- tab handle helper (Tampermonkey can return either a Tab object or a Promise<Tab>) ---
@@ -278,6 +279,37 @@ const settings = {
 // GoFile filename hints (from API) so we don't rely on URL-encoded path segments
 const gofileNameById = new Map();
 const gofileNameByUrl = new Map();
+
+// GoFile: the site itself authenticates CDN downloads (store*/cache*.gofile.io) via an
+// "accountToken" cookie, set client-side in account.js as:
+//   document.cookie = "accountToken=" + activeAccount.token + ";path=/;domain=gofile.io;SameSite=Lax;Secure;"
+// Our GM_xmlhttpRequest download calls send cookies (anonymous: false), so mirroring that
+// cookie with OUR already-resolved guest token keeps resolution and download on the same
+// account. (The old warm-up-tab-only approach loaded a bare gofile.io tab whose own JS has
+// no knowledge of our token -- it creates and cookies a brand-new, unrelated guest account,
+// which only works by chance.) Cheap local browser API, safe to call before every request.
+const gofileSyncCookie = token =>
+    new Promise(resolve => {
+        try {
+            if (!token || typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.set !== 'function') {
+                resolve(false);
+                return;
+            }
+            GM_cookie.set(
+                {
+                    name: 'accountToken',
+                    value: String(token),
+                    domain: 'gofile.io',
+                    path: '/',
+                    secure: true,
+                    sameSite: 'lax',
+                },
+                error => resolve(!error),
+            );
+        } catch (e) {
+            resolve(false);
+        }
+    });
 
 // Cyberdrop filename hints (from API)
 const cyberdropNameBySlug = new Map();
@@ -3154,36 +3186,47 @@ if (page === 1) {
             } catch (e) {}
 
             gmSet(AT_KEY, { token, ts: Date.now() });
+            await gofileSyncCookie(token);
             return token;
         };
 
         const getAccountToken = async (force = false) => {
             // If the user provided a personal Bearer token, always use it.
             // (This is optional; leaving it empty keeps the anonymous account-token flow.)
+            let token = null;
             try {
                 const override = settings?.hosts?.goFile?.bearerOverride;
                 if (override && String(override).trim() !== '') {
-                    return String(override).trim();
+                    token = String(override).trim();
                 }
             } catch (e) {}
 
-            const now = Date.now();
-
-            const cached = gmGet(AT_KEY, null);
-            if (!force && cached && cached.token && cached.ts && now - cached.ts < AT_MAX_AGE_MS) {
-                try {
-                    settings.hosts.goFile.token = cached.token;
-                } catch (e) {}
-                return cached.token;
+            if (!token) {
+                const now = Date.now();
+                const cached = gmGet(AT_KEY, null);
+                if (!force && cached && cached.token && cached.ts && now - cached.ts < AT_MAX_AGE_MS) {
+                    token = cached.token;
+                    try {
+                        settings.hosts.goFile.token = token;
+                    } catch (e) {}
+                }
             }
 
-            try {
-                if (!force && settings && settings.hosts && settings.hosts.goFile && settings.hosts.goFile.token) {
-                    return settings.hosts.goFile.token;
-                }
-            } catch (e) {}
+            if (!token) {
+                try {
+                    if (!force && settings && settings.hosts && settings.hosts.goFile && settings.hosts.goFile.token) {
+                        token = settings.hosts.goFile.token;
+                    }
+                } catch (e) {}
+            }
 
-            return await createAccountToken();
+            if (!token) {
+                // createAccountToken() already syncs the cookie for this token; avoid a double sync below.
+                return await createAccountToken();
+            }
+
+            await gofileSyncCookie(token);
+            return token;
         };
 
         const apiContentsRaw = async (contentId, passwordHash, token) => {
@@ -6474,6 +6517,16 @@ if (tmp.length) {
                 const isCyberdrop = String(host || '').toLowerCase() === 'cyberdrop';
                 const isBunkr = String((host && host.name) || '').toLowerCase() === 'bunkr' || /bunkr/i.test(String(url || '')) || /bunkr/i.test(String(original || ''));
                 const isFilester = String((host && host.name) || '').toLowerCase() === 'filester' || /(?:^|\.)filester\.(me|sh|si|gg)/i.test(String(url || ''));
+
+                // GoFile: make sure the browser's accountToken cookie matches the token that
+                // resolved this album BEFORE the first request (store links gate on this too,
+                // not just DIRECT) -- see gofileSyncCookie definition for why.
+                if (isGoFile) {
+                    try {
+                        const gfToken = settings?.hosts?.goFile?.token;
+                        if (gfToken) await gofileSyncCookie(gfToken);
+                    } catch (e) {}
+                }
 
                 // Filester: turn short /d/<slug> view URLs into cache /v/<token> stream URLs (no tabs).
                 // Album pages (/f/...) mostly contain only short slugs, which require this token step.
