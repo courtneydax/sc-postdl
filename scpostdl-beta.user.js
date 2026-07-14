@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b07
+// @version 3.20.b08
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -378,6 +378,7 @@ const gofileRestoreCookie = () =>
 
             GM_cookie.set(
                 {
+                    url: 'https://gofile.io/',
                     name: 'accountToken',
                     value: originalValue,
                     domain: 'gofile.io',
@@ -6236,6 +6237,12 @@ if (tmp.length) {
                 }
             };
             const gofileWarmupAttempted = new Set();
+            // url -> highest pass number currently authoritative. GM_xmlhttpRequest's abort()
+            // isn't always reliable once a blob response is substantially buffered, so a
+            // "stalled" pass-1 request can still fire onload after we've already moved on to a
+            // warm-up retry -- checked in the blob onload handler to stop that stale pass from
+            // also saving the file (duplicate download alongside the retry's result).
+            const gofileActivePass = new Map();
             const CYBERDROP_WARMUP_MS = 1500;
 
             const BLOB_MAX_BYTES = Math.floor(1.6 * 1024 * 1024 * 1024);
@@ -7249,6 +7256,10 @@ if (isGoFile || isPixeldrain || isFilester) {
 
 
                         if (abortReason === 'bunkr_maint' && bunkrMaintenanceHandled) return;
+                        // GoFile: this pass was superseded by a stall-triggered warm-up retry
+                        // (request.abort() above isn't always reliable once a blob response is
+                        // substantially buffered) -- a newer pass now owns saving this file.
+                        if (isGoFile && (gofileActivePass.get(url) || pass) > pass) return;
                         // GoFile: detect soft-block / HTML gate
                         if (isGoFile) {
                             const mCt = /content-type:\s*([^\r\n]+)/i.exec(response.responseHeaders || '');
@@ -7929,6 +7940,11 @@ return;
                         if (isGoFile && pass === 1 && !gofileWarmupAttempted.has(url)) {
                             gofileWarmupAttempted.add(url);
                             log.post.info(postId, `::GoFile stalled -> warm-up tab (${GOFILE_WARMUP_MS}ms) then retry [1/2]::: ${url}`, postNumber);
+                            // request.abort() above isn't always reliable once a blob response is
+                            // substantially buffered -- mark pass 2 as authoritative so a zombie
+                            // pass-1 onload (see the isGoFile guard at the top of onload) can't
+                            // also save the file.
+                            gofileActivePass.set(url, 2);
                             gofileWarmupOpenTab(url);
                             setTimeout(() => startDownload(resource, 2), GOFILE_WARMUP_MS);
                             return;
