@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b06
+// @version 3.20.b07
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -8277,6 +8277,13 @@ const selectedPosts = [];
 
 (function () {
     try { if (window.__XFPD_ABORT_MAIN) return; } catch (e) {}
+
+    // @match now covers gofile.io (required by GM_cookie for the accountToken sync -- see
+    // gofileSyncCookie), which also makes Tampermonkey inject/run this whole script on actual
+    // gofile.io page loads (e.g. the warm-up tab). None of the forum-post logic below applies
+    // there, so bail out immediately rather than doing pointless work (redgifs token fetch,
+    // style injection) on GoFile's own pages.
+    try { if (/(^|\.)gofile\.io$/i.test(location.hostname)) return; } catch (e) {}
 
     window.addEventListener('beforeunload', e => {
         if (processing.find(p => p.processing)) {
