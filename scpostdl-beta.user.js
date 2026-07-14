@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b04
+// @version 3.20.b05
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -302,7 +302,7 @@ const gofileCaptureOriginalCookie = () =>
             return;
         }
         try {
-            GM_cookie.list({ domain: 'gofile.io', name: 'accountToken' }, (cookies, error) => {
+            GM_cookie.list({ url: 'https://gofile.io/', domain: 'gofile.io', name: 'accountToken' }, (cookies, error) => {
                 if (error) {
                     console.warn('[GoFile] GM_cookie.list failed while capturing original accountToken cookie:', error);
                 } else {
@@ -330,6 +330,7 @@ const gofileSyncCookie = token =>
                 await gofileCaptureOriginalCookie();
                 GM_cookie.set(
                     {
+                        url: 'https://gofile.io/',
                         name: 'accountToken',
                         value: String(token),
                         domain: 'gofile.io',
@@ -364,7 +365,7 @@ const gofileRestoreCookie = () =>
 
             if (originalValue === null) {
                 if (typeof GM_cookie.delete === 'function') {
-                    GM_cookie.delete({ name: 'accountToken', domain: 'gofile.io', path: '/' }, error => {
+                    GM_cookie.delete({ url: 'https://gofile.io/', name: 'accountToken', domain: 'gofile.io', path: '/' }, error => {
                         if (error) console.warn('[GoFile] Failed to remove guest accountToken cookie during restore:', error);
                         resolve();
                     });
