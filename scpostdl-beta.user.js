@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b03
+// @version 3.20.b04
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -288,26 +288,108 @@ const gofileNameByUrl = new Map();
 // account. (The old warm-up-tab-only approach loaded a bare gofile.io tab whose own JS has
 // no knowledge of our token -- it creates and cookies a brand-new, unrelated guest account,
 // which only works by chance.) Cheap local browser API, safe to call before every request.
+//
+// Whatever accountToken cookie already exists (e.g. the user's own logged-in GoFile session)
+// gets overwritten by this. Capture it once per run so it can be restored via
+// gofileRestoreCookie() once no post is still processing (see setProcessing() below).
+let gofileCookieCaptured = false;
+let gofileOriginalCookieValue = null; // null = no cookie existed originally
+
+const gofileCaptureOriginalCookie = () =>
+    new Promise(resolve => {
+        if (gofileCookieCaptured || typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.list !== 'function') {
+            resolve();
+            return;
+        }
+        try {
+            GM_cookie.list({ domain: 'gofile.io', name: 'accountToken' }, (cookies, error) => {
+                if (error) {
+                    console.warn('[GoFile] GM_cookie.list failed while capturing original accountToken cookie:', error);
+                } else {
+                    const existing = Array.isArray(cookies) ? cookies.find(c => c && c.name === 'accountToken') : null;
+                    gofileOriginalCookieValue = existing ? existing.value : null;
+                }
+                gofileCookieCaptured = true;
+                resolve();
+            });
+        } catch (e) {
+            console.warn('[GoFile] GM_cookie.list threw while capturing original accountToken cookie:', e);
+            gofileCookieCaptured = true;
+            resolve();
+        }
+    });
+
 const gofileSyncCookie = token =>
     new Promise(resolve => {
-        try {
-            if (!token || typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.set !== 'function') {
+        (async () => {
+            try {
+                if (!token || typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.set !== 'function') {
+                    resolve(false);
+                    return;
+                }
+                await gofileCaptureOriginalCookie();
+                GM_cookie.set(
+                    {
+                        name: 'accountToken',
+                        value: String(token),
+                        domain: 'gofile.io',
+                        path: '/',
+                        secure: true,
+                        sameSite: 'lax',
+                    },
+                    error => {
+                        if (error) console.warn('[GoFile] GM_cookie.set failed for accountToken:', error);
+                        resolve(!error);
+                    },
+                );
+            } catch (e) {
+                console.warn('[GoFile] gofileSyncCookie threw:', e);
                 resolve(false);
+            }
+        })();
+    });
+
+// Restore whatever accountToken cookie existed before we started overwriting it (or remove
+// ours if none existed). Called once no post is still processing -- see setProcessing() below.
+const gofileRestoreCookie = () =>
+    new Promise(resolve => {
+        try {
+            if (!gofileCookieCaptured || typeof GM_cookie === 'undefined' || !GM_cookie) {
+                resolve();
                 return;
             }
+            const originalValue = gofileOriginalCookieValue;
+            gofileCookieCaptured = false;
+            gofileOriginalCookieValue = null;
+
+            if (originalValue === null) {
+                if (typeof GM_cookie.delete === 'function') {
+                    GM_cookie.delete({ name: 'accountToken', domain: 'gofile.io', path: '/' }, error => {
+                        if (error) console.warn('[GoFile] Failed to remove guest accountToken cookie during restore:', error);
+                        resolve();
+                    });
+                    return;
+                }
+                resolve();
+                return;
+            }
+
             GM_cookie.set(
                 {
                     name: 'accountToken',
-                    value: String(token),
+                    value: originalValue,
                     domain: 'gofile.io',
                     path: '/',
                     secure: true,
                     sameSite: 'lax',
                 },
-                error => resolve(!error),
+                error => {
+                    if (error) console.warn('[GoFile] Failed to restore original accountToken cookie:', error);
+                    resolve();
+                },
             );
         } catch (e) {
-            resolve(false);
+            resolve();
         }
     });
 
@@ -6824,7 +6906,7 @@ if (tmp.length) {
                         }
 
                         log.separator(postId);
-                        log.post.info(postId, `::Completed (direct)::: ${url}`, postNumber);
+                        log.post.info(postId, `::Handed off (direct)::: ${url}`, postNumber);
 
                         if (folder && folder.trim() !== '') {
                             log.post.info(postId, `::Saving as (direct)::: ${basename} ::to:: ${folder}`, postNumber);
@@ -8003,6 +8085,10 @@ if (needZipBlob) {
     }
 
     setProcessing(false, postId);
+
+    if (!processing.some(p => p.processing)) {
+        gofileRestoreCookie();
+    }
 
     if (totalDownloadable > 0) {
         // For logging in console since post logs are already written.
