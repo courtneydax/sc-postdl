@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b08
+// @version 3.20.b09
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -3187,12 +3187,16 @@ if (page === 1) {
         // GoFile no longer uses the static appdata.wt from config.js for /contents.
         // The website now derives a per-request X-Website-Token from the account token
         // via generateWT() in https://gofile.io/dist/js/wt.obf.js, i.e.:
-        //   WT = sha256(navigator.userAgent + "::" + navigator.language + "::" + token + "::<salt1>::<salt2>")
-        // The two salts rotate whenever GoFile updates wt.obf.js, so we fetch that
-        // script live, eval it in a scoped Function (it only reads navigator, and the
-        // function declaration stays local, not leaked to global), and cache the source
-        // for a day. WT must be computed with the same UA/language the request is sent
-        // with; the language is also echoed back to the server via the X-BL header.
+        //   WT = sha256(navigator.userAgent + "::" + navigator.language + "::" + token + "::<time>::<salt>")
+        // <time> is NOT a static value -- it's Math.floor(Date.now() / 1000 / 14400) (a
+        // 4-hour bucket), recomputed live inside generateWT() itself. <salt> is the one
+        // actual fixed constant, which can still change whenever GoFile updates the file.
+        // We fetch the script live, eval it in a scoped Function (it only reads navigator,
+        // and the function declaration stays local, not leaked to global), and cache the
+        // source for a day -- safe because we call the eval'd generateWT() fresh on every
+        // request, so Date.now() is always evaluated at call time, not baked in when the
+        // source was cached. WT must be computed with the same UA/language the request is
+        // sent with; the language is also echoed back to the server via the X-BL header.
         let cachedGenerateWT = null;
 
         const getGenerateWT = async (force = false) => {
