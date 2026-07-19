@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.20.b09
+// @version 3.20.b10
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -7936,10 +7936,10 @@ return;
                             return;
                         }
 
-                        // GoFile: make stalls visible and allow one warm-up retry.
-                        if (isGoFile) {
-                            log.post.error(postId, `::Stalled/Failed::: ${url}`, postNumber);
-                        }
+                        // Make stalls visible instead of silently counting a failed download as
+                        // complete (previously only GoFile logged this; every other host -- Bunkr
+                        // included -- fell through to completed++ with no indication of failure).
+                        log.post.error(postId, `::Stalled/Failed::: ${url}`, postNumber);
 
                         if (isGoFile && pass === 1 && !gofileWarmupAttempted.has(url)) {
                             gofileWarmupAttempted.add(url);
