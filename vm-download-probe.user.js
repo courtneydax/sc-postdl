@@ -3,12 +3,14 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Throwaway diagnostic for Violentmonkey's new browser-download API: does GM_download support nested paths and blob: URLs?
-// @version 0.1
+// @version 0.2
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/vm-download-probe.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/vm-download-probe.user.js
 // @match https://example.com/*
 // @match https://example.org/*
+// @match https://gofile.io/*
 // @grant GM_download
+// @grant GM_cookie
 // @grant GM_info
 // @connect *
 // @run-at document-idle
@@ -41,6 +43,34 @@
  *   apart from "nesting is broken". Check your Downloads folder against the verdicts —
  *   a reported OK only means a callback fired, NOT that the file landed where you wanted.
  *   "NO CALLBACK" is itself a real finding: silent failure is the behaviour we most suspect.
+ *
+ * RUNS WORTH DOING
+ *   a. Tampermonkey / Chrome           — baseline (done: all pass, nested)
+ *   b. Violentmonkey / Chrome, API on  — (done: all pass, nested)
+ *   c. Violentmonkey / Chrome, API off — (done: all pass, flattened to `_`)
+ *   d. Tampermonkey / FIREFOX          — still needed. The main script flattens on Firefox
+ *      (`isFF`) and nobody remembers why. Evidence says nesting depends on downloadMode, not
+ *      on the browser, so if the three nested files land in a real subfolder here, that
+ *      Firefox-specific flattening is dead code and can be replaced by a capability check.
+ *
+ * COOKIE TESTS (v0.2) — the other blocker for Violentmonkey support
+ *   The main script drives GoFile downloads through GM_cookie (13 call sites). Under
+ *   Tampermonkey that API turned out to have two non-obvious gates, each only visible after
+ *   fixing the previous one: `set` needs an explicit `url:` field, AND the target domain must
+ *   be covered by @match/@include (separately from @connect). Whether Violentmonkey has the
+ *   same gates, or different ones, is unknown — so:
+ *
+ *   Q5  Does GM_cookie exist at all, and which of list/set/delete are implemented?
+ *   Q6  What is the callback contract? TM uses (cookies, error) for list and (error) for
+ *       set/delete. The probe logs the RAW callback arguments so the real shape is visible
+ *       rather than assumed.
+ *   Q7  Does `set` require an explicit `url:`? Tested both ways, with and without.
+ *   Q8  Does a full round-trip work: set -> list -> verify value -> delete -> list -> gone?
+ *
+ *   Safety: the probe uses its own cookie name (`vmprobe_test`) and never writes GoFile's real
+ *   `accountToken`. It reads that one once to prove `list` works against a real cookie, and
+ *   reports only whether it exists plus its length — never the value, since these logs get
+ *   pasted around.
  */
 
 (function () {
@@ -245,6 +275,145 @@
         },
     ];
 
+    // ---------- cookie probe ----------
+
+    const COOKIE_URL = 'https://gofile.io/';
+    const COOKIE_DOMAIN = 'gofile.io';
+    const TEST_COOKIE = 'vmprobe_test';
+    const REAL_COOKIE = 'accountToken';   // read-only, never written by this probe
+
+    function cookieApi() {
+        if (typeof GM_cookie === 'object' && GM_cookie) return { api: GM_cookie, style: 'GM_cookie' };
+        if (typeof GM !== 'undefined' && GM && GM.cookie) return { api: GM.cookie, style: 'GM.cookie' };
+        return null;
+    }
+
+    /**
+     * Calls a GM_cookie method and reports the RAW callback arguments, because the contract
+     * differs between handlers and we want to see it rather than assume it.
+     */
+    function callCookie(method, details) {
+        const c = cookieApi();
+        if (!c) return Promise.resolve({ missing: 'no GM_cookie / GM.cookie at all' });
+        const fn = c.api[method];
+        if (typeof fn !== 'function') return Promise.resolve({ missing: `${c.style}.${method} is ${typeof fn}` });
+
+        return new Promise(resolve => {
+            let settled = false;
+            const done = r => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
+            const timer = setTimeout(() => done({ timedOut: true }), 10000);
+            try {
+                const ret = fn.call(c.api, details, (...args) => done({ args, viaPromise: false }));
+                if (ret && typeof ret.then === 'function') {
+                    ret.then(v => done({ args: [v], viaPromise: true }),
+                             e => done({ args: [e], viaPromise: true, rejected: true }));
+                }
+            } catch (e) {
+                done({ threw: String((e && e.message) || e) });
+            }
+        });
+    }
+
+    // The callback shape is what we're measuring, so interpret defensively.
+    const pickCookies = r => (r.args || []).find(a => Array.isArray(a)) || null;
+    const pickError = r => {
+        if (r.threw) return r.threw;
+        if (r.timedOut) return 'no callback within 10s';
+        if (r.missing) return r.missing;
+        const e = (r.args || []).find(a => typeof a === 'string' || a instanceof Error
+            || (a && typeof a === 'object' && !Array.isArray(a) && (a.message || a.error)));
+        if (!e) return null;
+        return typeof e === 'string' ? e : String(e.message || e.error || e);
+    };
+
+    function describeArgs(r) {
+        if (r.missing) return `MISSING: ${r.missing}`;
+        if (r.threw) return `THREW: ${r.threw}`;
+        if (r.timedOut) return 'NO CALLBACK within 10s';
+        const shapes = (r.args || []).map(a =>
+            a === undefined ? 'undefined'
+            : a === null ? 'null'
+            : Array.isArray(a) ? `array(${a.length})`
+            : a instanceof Error ? `Error(${a.message})`
+            : typeof a === 'object' ? `object{${Object.keys(a).join(',')}}`
+            : `${typeof a}(${JSON.stringify(a)})`);
+        return `${r.viaPromise ? 'promise' : 'callback'} args: [${shapes.join(', ')}]`;
+    }
+
+    async function runCookieTests() {
+        const c = cookieApi();
+        log('─── cookie tests ──────────────────────────');
+        if (!c) {
+            record('GM_cookie', 'MISSING', 'neither GM_cookie nor GM.cookie is defined — check @grant', readDownloadMode(), 0, 0);
+            return;
+        }
+        log(`   API: ${c.style} — list=${typeof c.api.list}, set=${typeof c.api.set}, delete=${typeof c.api.delete}`, 'note');
+
+        const step = async (label, method, details, verdictFn) => {
+            const t0 = Date.now();
+            const r = await callCookie(method, details);
+            log(`▶ ${label}`);
+            log(`   ${describeArgs(r)}`);
+            const err = pickError(r);
+            const { verdict, detail } = verdictFn(r, err);
+            record(label, verdict, detail, readDownloadMode(), Date.now() - t0, (r.args || []).length);
+            return r;
+        };
+
+        // Q5/Q6: does `list` work against a real, pre-existing cookie? Value is never logged.
+        await step(`cookie list (${REAL_COOKIE}, read-only)`, 'list', { url: COOKIE_URL, name: REAL_COOKIE },
+            (r, err) => {
+                const cookies = pickCookies(r);
+                if (err && !cookies) return { verdict: 'ERROR', detail: err };
+                if (!cookies) return { verdict: 'UNKNOWN SHAPE', detail: describeArgs(r) };
+                const hit = cookies.find(x => x && x.name === REAL_COOKIE);
+                return {
+                    verdict: 'OK',
+                    // Deliberately redacted: these logs get pasted around.
+                    detail: hit ? `present, value length ${String(hit.value || '').length}` : 'no such cookie (fine if never visited)',
+                };
+            });
+
+        // Q7: does `set` need an explicit url:? This was gate #1 under Tampermonkey.
+        const value = `probe-${Date.now()}`;
+        await step('cookie set WITHOUT url (domain only)', 'set',
+            { name: TEST_COOKIE, value: `${value}-nourl`, domain: COOKIE_DOMAIN, path: '/', secure: true, sameSite: 'lax' },
+            (r, err) => err ? { verdict: 'ERROR', detail: err } : { verdict: 'OK', detail: 'accepted without url' });
+
+        await step('cookie set WITH url', 'set',
+            { url: COOKIE_URL, name: TEST_COOKIE, value, domain: COOKIE_DOMAIN, path: '/', secure: true, sameSite: 'lax' },
+            (r, err) => err ? { verdict: 'ERROR', detail: err } : { verdict: 'OK', detail: 'accepted with url' });
+
+        // Q8: round-trip. Did the value we just wrote actually land?
+        await step('cookie read back', 'list', { url: COOKIE_URL, name: TEST_COOKIE },
+            (r, err) => {
+                const cookies = pickCookies(r);
+                if (err && !cookies) return { verdict: 'ERROR', detail: err };
+                const hit = (cookies || []).find(x => x && x.name === TEST_COOKIE);
+                if (!hit) return { verdict: 'NOT WRITTEN', detail: 'set reported no error but nothing came back' };
+                return hit.value === value
+                    ? { verdict: 'OK', detail: `round-trip exact: ${hit.value}` }
+                    : { verdict: 'MISMATCH', detail: `got "${hit.value}", expected "${value}"` };
+            });
+
+        await step('cookie delete', 'delete', { url: COOKIE_URL, name: TEST_COOKIE },
+            (r, err) => err ? { verdict: 'ERROR', detail: err } : { verdict: 'OK', detail: 'delete accepted' });
+
+        await step('cookie confirm gone', 'list', { url: COOKIE_URL, name: TEST_COOKIE },
+            (r, err) => {
+                const cookies = pickCookies(r);
+                if (err && !cookies) return { verdict: 'ERROR', detail: err };
+                const hit = (cookies || []).find(x => x && x.name === TEST_COOKIE);
+                return hit
+                    ? { verdict: 'STILL THERE', detail: `delete did not remove it (value "${hit.value}")` }
+                    : { verdict: 'OK', detail: 'cleaned up' };
+            });
+
+        log('─── cookie tests done ─────────────────────', 'note');
+        log('If everything errored, try loading this page on https://gofile.io/ instead — that', 'note');
+        log('distinguishes an @match/permission gate from a broken GM_cookie implementation.', 'note');
+    }
+
     async function runAll() {
         log('─── run all ───────────────────────────────');
         for (const t of TESTS) {
@@ -262,6 +431,7 @@
             `downloadMode: ${readDownloadMode()}`,
             `GM_download:  ${typeof GM_download}`,
             `GM.download:  ${(typeof GM !== 'undefined' && GM && typeof GM.download) || 'undefined'}`,
+            `GM_cookie:    ${typeof GM_cookie}${cookieApi() ? ` (${cookieApi().style}: ${['list', 'set', 'delete'].filter(m => typeof cookieApi().api[m] === 'function').join('/') || 'no methods'})` : ''}`,
             `injectInto:   ${(i.injectInto || i.script && i.script.injectInto) || '(unknown)'}`,
             `page origin:  ${location.origin}`,
             `userAgent:    ${navigator.userAgent}`,
@@ -344,6 +514,7 @@
         };
 
         addBtn('Run all', runAll);
+        addBtn('Run cookie tests', runCookieTests);
         for (const t of TESTS) addBtn(t.name, () => runTest(t));
         addBtn('Re-read downloadMode', () => {
             // Q3: toggle the VM setting, then click this WITHOUT reloading.
