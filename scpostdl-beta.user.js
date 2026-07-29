@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b03
+// @version 3.21.b04
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -7912,6 +7912,17 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                 const intervalId = setInterval(async () => {
                     const p = requestProgress.find(r => r.url === progressKey);
                     if (!p) return;
+
+                    // Large files switch to DIRECT mid-download: that aborts this request and hands
+                    // off to GM_download. request.abort() does not reliably fire onload/onerror once
+                    // a blob response is buffered (see the GoFile duplicate-save fix), so nothing
+                    // clears this interval. Without the guard the watchdog then reports a false
+                    // ::Stalled/Failed:: for a download that actually succeeded, and increments the
+                    // counter a second time -- the DIRECT onload already counts it, giving 3/2.
+                    if (switchedToDirect) {
+                        clearInterval(p.intervalId);
+                        return;
+                    }
 
                     if (p.old === p.new) {
                         const rr = requests.find(r => r.url === progressKey);
