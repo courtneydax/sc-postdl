@@ -276,6 +276,8 @@ const xfpdRuntime = (() => {
             downloadIcon: isMobile ? '↓' : '🡳',
             tooltipPlacement: isMobile ? 'bottom' : 'left',
             tooltipMaxWidth: isMobile ? '96vw' : 350,
+            // content-box is the CSS default, so desktop renders exactly as it did pre-mobile.
+            boxSizing: isMobile ? 'border-box' : 'content-box',
             formWidth: isMobile ? 'min(92vw, 340px)' : '300px',
             formMinWidth: isMobile ? '0' : '300px',
             formMaxWidth: isMobile ? '92vw' : 'none',
@@ -1843,17 +1845,18 @@ const ui = {
             const container = document.createElement('div');
             container.style.color = color;
             container.style.fontSize = '12px';
-            container.style.maxWidth = '100%';
 
             const span = document.createElement('span');
             // Status lines carry long URLs; on a narrow screen they must wrap instead of
-            // stretching the post and forcing a horizontal scroll.
-            span.style.display = 'inline-block';
-            span.style.maxWidth = '100%';
-            span.style.whiteSpace = 'normal';
-            span.style.wordBreak = 'break-word';
-            span.style.overflowWrap = 'anywhere';
+            // stretching the post and forcing a horizontal scroll. Mobile only -- desktop keeps
+            // the original single-line rendering.
             if (xfpdRuntime.isMobile) {
+                container.style.maxWidth = '100%';
+                span.style.display = 'inline-block';
+                span.style.maxWidth = '100%';
+                span.style.whiteSpace = 'normal';
+                span.style.wordBreak = 'break-word';
+                span.style.overflowWrap = 'anywhere';
                 span.style.lineHeight = '1.35';
             }
             container.appendChild(span);
@@ -1970,7 +1973,7 @@ const ui = {
           <form
             id="downloader-page-config-form"
             class="menu-content"
-            style="padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:border-box;"
+            style="padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:${xfpdRuntime.ui.boxSizing};"
           >
             ${innerHTML}
           </form>
@@ -1989,7 +1992,7 @@ const ui = {
           <form
             id="download-config-form-${postId}"
             class="menu-content"
-            style="user-select: none; padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:border-box;"
+            style="user-select: none; padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:${xfpdRuntime.ui.boxSizing};"
           >
             ${innerHTML}
           </form>
@@ -8736,16 +8739,14 @@ const selectedPosts = [];
                 e.preventDefault();
 
                 // Mobile: first tap opens the settings tooltip (there is no hover to open it
-                // with), second tap closes it and starts the download. Desktop just dismisses
-                // an open tooltip so it does not sit over the progress bars.
+                // with), second tap closes it and starts the download. Desktop is left alone --
+                // hover drives the tooltip there, as before.
                 if (xfpdRuntime.isMobile && postConfigTooltip) {
                     const isShown = !!(postConfigTooltip.state && postConfigTooltip.state.isShown);
                     if (!isShown) {
                         try { postConfigTooltip.show(); } catch (e2) {}
                         return;
                     }
-                    try { postConfigTooltip.hide(); } catch (e2) {}
-                } else if (postConfigTooltip && postConfigTooltip.state && postConfigTooltip.state.isShown) {
                     try { postConfigTooltip.hide(); } catch (e2) {}
                 }
 
@@ -8807,7 +8808,7 @@ const selectedPosts = [];
                         const { postId, contentContainer } = post.parsedPost;
                         ui.tooltip(
                             `#post-content-${postId}`,
-                            `<div style="overflow-y: auto; background: #242323; padding: 16px; width: ${xfpdRuntime.ui.previewWidth}; max-width: ${xfpdRuntime.ui.previewMaxWidth}; max-height: ${xfpdRuntime.ui.previewMaxHeight}; box-sizing: border-box;">
+                            `<div style="overflow-y: auto; background: #242323; padding: 16px; width: ${xfpdRuntime.ui.previewWidth}; max-width: ${xfpdRuntime.ui.previewMaxWidth}; max-height: ${xfpdRuntime.ui.previewMaxHeight}; box-sizing: ${xfpdRuntime.ui.boxSizing};">
                           ${contentContainer.innerHTML}
                          </div>`,
                             {
