@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm04
+// @version 3.21.vm05
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -122,7 +122,9 @@
 // @connect filester.gg
 // @run-at document-start
 // @grant GM_xmlhttpRequest
+// @grant GM.xmlHttpRequest
 // @grant GM_download
+// @grant GM.download
 // @grant GM_setValue
 // @grant GM_getValue
 // @grant GM_log
@@ -130,6 +132,167 @@
 // @grant GM_cookie
 
 // ==/UserScript==
+
+// --- Violentmonkey build: GM API resolution ------------------------------------------------
+// The legacy callback API (GM_xmlhttpRequest / GM_download) is not guaranteed to be a property
+// of `window`, and on GM4-only handlers -- Firefox for Android in particular -- it may not exist
+// at all, leaving only the promise-based GM.* API. Resolve through a ladder and bridge the
+// promise form back to the callbacks the rest of the script expects.
+//
+// These wrappers are transport only. Name flattening and the FileSaver split stay in the
+// capability layer below, at the call sites -- do not fold them in here or names get flattened
+// twice.
+const xfpdGMApi = (typeof GM === 'object' && GM) ? GM : null;
+
+const xfpdLegacyGMXmlHttpRequest =
+    (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null) ||
+    (typeof window.GM_xmlhttpRequest === 'function' ? window.GM_xmlhttpRequest.bind(window) : null);
+const xfpdModernGMXmlHttpRequest =
+    (xfpdGMApi && typeof xfpdGMApi.xmlHttpRequest === 'function' ? xfpdGMApi.xmlHttpRequest.bind(xfpdGMApi) : null);
+const xfpdNativeGMXmlHttpRequest = xfpdLegacyGMXmlHttpRequest || xfpdModernGMXmlHttpRequest;
+
+const xfpdLegacyGMDownload =
+    (typeof GM_download === 'function' ? GM_download : null) ||
+    (typeof window.GM_download === 'function' ? window.GM_download.bind(window) : null);
+const xfpdModernGMDownload =
+    (xfpdGMApi && typeof xfpdGMApi.download === 'function' ? xfpdGMApi.download.bind(xfpdGMApi) : null);
+const xfpdNativeGMDownload = xfpdLegacyGMDownload || xfpdModernGMDownload;
+
+function xfpdGM_xmlhttpRequest(details) {
+    if (typeof xfpdNativeGMXmlHttpRequest !== 'function') {
+        throw new Error('GM_xmlhttpRequest / GM.xmlHttpRequest is not available.');
+    }
+    const req = (details && typeof details === 'object') ? details : {};
+    const out = xfpdNativeGMXmlHttpRequest(req);
+
+    // Promise form: no readyState/progress events to relay, so synthesise the two the callers
+    // actually branch on. Callers that need onprogress degrade to a single completion event.
+    if (!xfpdLegacyGMXmlHttpRequest && out && typeof out.then === 'function') {
+        out.then(r => {
+            try {
+                if (typeof req.onreadystatechange === 'function') req.onreadystatechange({ ...r, readyState: 2 });
+            } catch (e) {}
+            try { if (typeof req.onload === 'function') req.onload(r); } catch (e) {}
+        }).catch(e => {
+            const msg = String((e && (e.name || e.error || e.message)) || '');
+            if (/timeout/i.test(msg)) {
+                try { if (typeof req.ontimeout === 'function') req.ontimeout(e); } catch (e2) {}
+            } else {
+                try { if (typeof req.onerror === 'function') req.onerror(e); } catch (e2) {}
+            }
+        });
+    }
+
+    // Callers call .abort() on the handle unconditionally (see the stall watchdog).
+    if (out && typeof out.abort === 'function') return out;
+    return out || { abort: () => {} };
+}
+
+function xfpdGM_download(optsOrUrl, name) {
+    if (typeof xfpdNativeGMDownload !== 'function') {
+        throw new Error('GM_download / GM.download is not available.');
+    }
+
+    const opts = typeof optsOrUrl === 'string'
+        ? { url: optsOrUrl, name: String(name || '') }
+        : (optsOrUrl && typeof optsOrUrl === 'object' ? { ...optsOrUrl } : null);
+    if (!opts || !opts.url) throw new Error('GM_download called without a valid "url".');
+
+    const out = xfpdNativeGMDownload(opts);
+
+    if (!xfpdLegacyGMDownload && out && typeof out.then === 'function') {
+        out.then(r => {
+            try { if (typeof opts.onload === 'function') opts.onload(r); } catch (e) {}
+        }).catch(e => {
+            const msg = String((e && (e.name || e.error || e.message)) || '');
+            if (/timeout/i.test(msg)) {
+                try { if (typeof opts.ontimeout === 'function') opts.ontimeout(e); } catch (e2) {}
+            } else {
+                try { if (typeof opts.onerror === 'function') opts.onerror(e); } catch (e2) {}
+            }
+        });
+    }
+    return out;
+}
+// -------------------------------------------------------------------------------------------
+
+// --- Violentmonkey build: device profile ---------------------------------------------------
+// Ported from the contributor's VM2 reference build. Everything the UI needs to differ on a
+// phone is resolved once, here, so the call sites stay readable and there is a single place to
+// override. Detection is UA + coarse-pointer, with a manual escape hatch:
+//
+//     GM_setValue('xfpd_device_mode', 'mobile' | 'desktop' | 'auto')
+//
+// The arrow/download glyphs (U+1F892, U+1F873) are astral-plane and render as tofu in a lot of
+// mobile fonts, so mobile substitutes plain BMP characters.
+const xfpdUserAgent = (() => {
+    try {
+        return String((typeof navigator !== 'undefined' && navigator && navigator.userAgent) || '');
+    } catch (e) {
+        return '';
+    }
+})();
+const xfpdIsAndroidUA = /android/i.test(xfpdUserAgent);
+const xfpdIsIOSUA = /iphone|ipad|ipod/i.test(xfpdUserAgent)
+    || (typeof navigator !== 'undefined' && /macintosh/i.test(xfpdUserAgent) && Number(navigator.maxTouchPoints || 0) > 1);
+const xfpdIsMobileUA = /mobile|android|iphone|ipad|ipod|iemobile|opera mini/i.test(xfpdUserAgent);
+const xfpdIsCoarsePointer = (() => {
+    try {
+        return !!(typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+            && window.matchMedia('(pointer: coarse)').matches);
+    } catch (e) {
+        return false;
+    }
+})();
+const xfpdDeviceModeOverride = (() => {
+    try {
+        const raw = String((typeof GM_getValue === 'function' ? GM_getValue('xfpd_device_mode', 'auto') : 'auto') || 'auto')
+        .toLowerCase()
+        .trim();
+        return raw === 'desktop' || raw === 'mobile' ? raw : 'auto';
+    } catch (e) {
+        return 'auto';
+    }
+})();
+
+function xfpdPrefixLabel(icon, text) {
+    const i = String(icon || '').trim();
+    return i ? `${i} ${text}` : text;
+}
+
+const xfpdRuntime = (() => {
+    const autoMobile = xfpdIsMobileUA || xfpdIsCoarsePointer;
+    const isMobile = xfpdDeviceModeOverride === 'mobile'
+        ? true
+        : (xfpdDeviceModeOverride === 'desktop' ? false : autoMobile);
+    const platform = isMobile ? (xfpdIsIOSUA ? 'ios' : (xfpdIsAndroidUA ? 'android' : 'mobile')) : 'desktop';
+
+    return {
+        isMobile,
+        isDesktop: !isMobile,
+        platform,
+        ui: {
+            statusSeparator: isMobile ? '›' : '🢒',
+            downloadIcon: isMobile ? '↓' : '🡳',
+            tooltipPlacement: isMobile ? 'bottom' : 'left',
+            tooltipMaxWidth: isMobile ? '96vw' : 350,
+            formWidth: isMobile ? 'min(92vw, 340px)' : '300px',
+            formMinWidth: isMobile ? '0' : '300px',
+            formMaxWidth: isMobile ? '92vw' : 'none',
+            previewWidth: isMobile ? 'min(92vw, 500px)' : '500px',
+            previewMaxWidth: isMobile ? '92vw' : '500px',
+            previewMaxHeight: isMobile ? 'min(70vh, 500px)' : '500px',
+            statusResourceMaxLength: isMobile ? 56 : 80,
+            statusUrlMaxLength: isMobile ? 56 : 80,
+        },
+    };
+})();
+
+const XFPD_STATUS_ARROW = xfpdRuntime.ui.statusSeparator;
+const XFPD_DOWNLOAD_BUTTON_TEXT = xfpdPrefixLabel(xfpdRuntime.ui.downloadIcon, 'Download');
+const XFPD_DOWNLOAD_PAGE_BUTTON_TEXT = xfpdPrefixLabel(xfpdRuntime.ui.downloadIcon, 'Download Page');
+// -------------------------------------------------------------------------------------------
+
 // --- tab handle helper (Tampermonkey can return either a Tab object or a Promise<Tab>) ---
 function xfpdCloseTabHandle(tabOrPromise) {
     try {
@@ -152,7 +315,7 @@ function xfpdCloseTabHandle(tabOrPromise) {
 // ---------------------------------------------------------------------------
 const JSZip = window.JSZip;
 const tippy = window.tippy;
-const http = window.GM_xmlhttpRequest;
+const http = xfpdGM_xmlhttpRequest;
 window.isFF = typeof InstallTrigger !== 'undefined';
 
 // --- Violentmonkey build: capability layer -----------------------------------------------
@@ -221,7 +384,7 @@ window.saveBlobAs = (blob, name, handlers) => {
         try { URL.revokeObjectURL(blobUrl); } catch (e) {}
         if (fn) fn(arg);
     };
-    GM_download({
+    xfpdGM_download({
         url: blobUrl,
         name,
         onload: release(cb.onload),
@@ -1631,7 +1794,8 @@ const ui = {
             allowHTML: true,
             content: content,
             appendTo: () => document.body,
-            placement: 'left',
+            placement: xfpdRuntime.ui.tooltipPlacement,
+            maxWidth: xfpdRuntime.ui.tooltipMaxWidth,
             interactive: true,
             ...options,
         });
@@ -1679,8 +1843,19 @@ const ui = {
             const container = document.createElement('div');
             container.style.color = color;
             container.style.fontSize = '12px';
+            container.style.maxWidth = '100%';
 
             const span = document.createElement('span');
+            // Status lines carry long URLs; on a narrow screen they must wrap instead of
+            // stretching the post and forcing a horizontal scroll.
+            span.style.display = 'inline-block';
+            span.style.maxWidth = '100%';
+            span.style.whiteSpace = 'normal';
+            span.style.wordBreak = 'break-word';
+            span.style.overflowWrap = 'anywhere';
+            if (xfpdRuntime.isMobile) {
+                span.style.lineHeight = '1.35';
+            }
             container.appendChild(span);
 
             if (initialText) {
@@ -1712,7 +1887,7 @@ const ui = {
         createPostDownloadButton: () => {
             const downloadPostBtn = document.createElement('a');
             downloadPostBtn.setAttribute('href', '#');
-            downloadPostBtn.innerHTML = '🡳 Download';
+            downloadPostBtn.textContent = XFPD_DOWNLOAD_BUTTON_TEXT;
 
             return downloadPostBtn;
         },
@@ -1795,7 +1970,7 @@ const ui = {
           <form
             id="downloader-page-config-form"
             class="menu-content"
-            style="padding: 5px 10px; background: ${backgroundColor};width:300px; min-width: 300px;"
+            style="padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:border-box;"
           >
             ${innerHTML}
           </form>
@@ -1814,7 +1989,7 @@ const ui = {
           <form
             id="download-config-form-${postId}"
             class="menu-content"
-            style="user-select: none; padding: 5px 10px; background: ${backgroundColor};width:300px; min-width: 300px;"
+            style="user-select: none; padding: 5px 10px; background: ${backgroundColor}; width:${xfpdRuntime.ui.formWidth}; min-width:${xfpdRuntime.ui.formMinWidth}; max-width:${xfpdRuntime.ui.formMaxWidth}; box-sizing:border-box;"
           >
             ${innerHTML}
           </form>
@@ -1990,7 +2165,10 @@ const ui = {
 
                     const configForm = ui.forms.config.post.createForm(postId, color, formHtml.join(''));
 
-                    ui.tooltip(btnDownloadPost, configForm, {
+                    return ui.tooltip(btnDownloadPost, configForm, {
+                        // On a phone there is no hover: the settings tooltip is opened and closed
+                        // by tapping the button (see the click handler), so tippy must not drive it.
+                        ...(xfpdRuntime.isMobile ? { trigger: 'manual' } : {}),
                         onShown: instance => {
                             const inputEl = h.element(`#filename-input-${postId}`);
                             if (inputEl) {
@@ -2119,7 +2297,7 @@ h.element(`#settings-${postId}-generate-links`).addEventListener('change', e => 
                                         .filter(host => host.enabled && host.resources.length)
                                         .reduce((acc, host) => acc + host.resources.length, 0);
 
-                                        btnDownloadPost.innerHTML = `🡳 Download (${totalDownloadableResources}/${totalResources})`;
+                                        btnDownloadPost.textContent = `${XFPD_DOWNLOAD_BUTTON_TEXT} (${totalDownloadableResources}/${totalResources})`;
 
                                         if (parsedHosts.length > 1) {
                                             const toggleAllHostsCheckbox = h.element(`#settings-toggle-all-hosts-${postId}`);
@@ -2281,7 +2459,7 @@ const xfpdJitterMs = (minMs, maxMs) => {
 
 const xfpdGmGetText = (getUrl, headers, timeoutMs) => new Promise(resolve => {
     try {
-        GM_xmlhttpRequest({
+        xfpdGM_xmlhttpRequest({
             method: 'GET',
             url: String(getUrl),
             headers: headers || {},
@@ -4394,7 +4572,7 @@ if (page === 1) {
 
                 const cyberdropGmGetText = (reqUrl, hdrs) => new Promise(resolve => {
                     try {
-                        GM_xmlhttpRequest({
+                        xfpdGM_xmlhttpRequest({
                             method: 'GET',
                             url: String(reqUrl),
                             headers: hdrs || {},
@@ -5984,7 +6162,7 @@ log.post.info(postId, '::Url resolution started::', postNumber);
         for (const resource of resources) {
             resolvingIndex++;
             h.ui.setElProps(statusLabel, { color: '#469cf3', fontWeight: 'bold' });
-            h.ui.setText(statusLabel, `Resolving: ${resolvingIndex} / ${totalResourcesToResolve} 🢒 ${h.limit(resource, 80)}`);
+            h.ui.setText(statusLabel, `Resolving: ${resolvingIndex} / ${totalResourcesToResolve} ${XFPD_STATUS_ARROW} ${h.limit(resource, xfpdRuntime.ui.statusResourceMaxLength)}`);
 
             for (const resolver of resolvers) {
                 const patterns = resolver[0];
@@ -6095,7 +6273,7 @@ r = await h.promise(resolve => resolve(resolverCB(resource, h.http, passwords, p
     const totalResources = enabledHosts.reduce((acc, h) => h.resources.length + acc, 0);
 
     h.ui.setElProps(statusLabel, { color: '#47ba24', fontWeight: 'bold' });
-    h.ui.setText(statusLabel, `Resolved: ${resolved.length} / ${totalDownloadable} 🢒 ${totalResources} Total Links`);
+    h.ui.setText(statusLabel, `Resolved: ${resolved.length} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${totalResources} Total Links`);
 
     const filenames = [];
     const mimeTypes = [];
@@ -6325,7 +6503,7 @@ if (tmp.length) {
 
             const gmGetTextWithHeaders = (getUrl, headers) => new Promise(resolve => {
                 try {
-                    GM_xmlhttpRequest({
+                    xfpdGM_xmlhttpRequest({
                         method: 'GET',
                         url: getUrl,
                         headers: headers || {},
@@ -6442,7 +6620,7 @@ if (tmp.length) {
 
             const gmHead = (headUrl, reflink) => new Promise(resolve => {
                 try {
-                    GM_xmlhttpRequest({
+                    xfpdGM_xmlhttpRequest({
                         method: 'HEAD',
                         url: headUrl,
                                                 onload: r => resolve({ ok: true, status: r.status, headers: r.responseHeaders || '' }),
@@ -6456,7 +6634,7 @@ if (tmp.length) {
 
             const gmGetText = (getUrl, reflink) => new Promise(resolve => {
                 try {
-                    GM_xmlhttpRequest({
+                    xfpdGM_xmlhttpRequest({
                         method: 'GET',
                         url: getUrl,
                                                 onload: r => resolve({ ok: true, status: r.status, text: r.responseText || '' }),
@@ -6870,7 +7048,7 @@ if (tmp.length) {
                     } catch (e) {}
                 }
 
-                const ellipsedUrl = h.limit(url, 80);
+                const ellipsedUrl = h.limit(url, xfpdRuntime.ui.statusUrlMaxLength);
                 log.post.info(postId, `::Downloading${isGoFile && pass > 1 ? ' (retry)' : ''}::: ${url}`, postNumber);
 
                 if (isCyberdrop && pass === 1 && cyberOrigin && cyberFilePage && /gigachad-cdn\.ru|cuckcapital\.cr/i.test(String(url || '')) && !cyberdropDirectWarmupDone) {
@@ -7110,7 +7288,7 @@ if (tmp.length) {
 
                                         const pre = await new Promise(resolve => {
                                             try {
-                                                GM_xmlhttpRequest({
+                                                xfpdGM_xmlhttpRequest({
                                                     method: 'GET',
                                                     url: String(cand),
                                                     responseType: 'text',
@@ -7163,9 +7341,9 @@ const imagebamHeaders = isImagebamCdnUrl(url) ? { Referer: imagebamRefererForCdn
                                 const totalMB = totalBytes ? Number(totalBytes / 1024 / 1024).toFixed(2) : '??';
                                 if (!totalBytes) {
                                     h.ui.setElProps(filePB, { width: '0%' });
-                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${host.name} 🢒 DIRECT 🢒 ${loadedMB} MB 🢒 ${ellipsedUrl}`);
+                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${host.name} ${XFPD_STATUS_ARROW} DIRECT ${XFPD_STATUS_ARROW} ${loadedMB} MB ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 } else {
-                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${host.name} 🢒 DIRECT 🢒 ${loadedMB} MB / ${totalMB} MB  🢒 ${ellipsedUrl}`);
+                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${host.name} ${XFPD_STATUS_ARROW} DIRECT ${XFPD_STATUS_ARROW} ${loadedMB} MB / ${totalMB} MB  ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                     h.ui.setElProps(filePB, {
                                         width: `${(e.loaded / totalBytes) * 100}%`,
                                     });
@@ -7175,7 +7353,7 @@ const imagebamHeaders = isImagebamCdnUrl(url) ? { Referer: imagebamRefererForCdn
                                 completed++;
                                 completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#2d9053' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7185,7 +7363,7 @@ const imagebamHeaders = isImagebamCdnUrl(url) ? { Referer: imagebamRefererForCdn
                                 completed++;
                                 completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7205,7 +7383,7 @@ if (imagebamHeaders && isFF) {
                             // Imagebam CDN often blocks hotlinking without a Referer. In Firefox, GM_download headers
                             // are unreliable, so fetch as a blob with GM_xmlhttpRequest (with Referer) then save.
                             try {
-                                GM_xmlhttpRequest({
+                                xfpdGM_xmlhttpRequest({
                                     method: 'GET',
                                     url,
                                     headers: imagebamHeaders,
@@ -7248,7 +7426,7 @@ if (imagebamHeaders && isFF) {
                                     const ref = String(filesterRefByUrl.get(String(url)) || (resource && resource.original) || 'https://filester.me/');
                                     const pre = await new Promise(resolve => {
                                         try {
-                                            GM_xmlhttpRequest({
+                                            xfpdGM_xmlhttpRequest({
                                                 method: 'GET',
                                                 url: String(dlOpts.url),
                                                 responseType: 'text',
@@ -7271,7 +7449,7 @@ if (imagebamHeaders && isFF) {
                                 } catch (e) {}
                             }
 
-GM_download(dlOpts);
+xfpdGM_download(dlOpts);
                         }
 
                     } catch (e) {
@@ -7314,7 +7492,7 @@ if (isGoFile || isPixeldrain || isFilester) {
                 const filesterRef = isFilester ? String(filesterRefByUrl.get(String(url)) || (resource && resource.original) || 'https://filester.me/') : '';
                 const reqHeaders = isTurboCdn ? { Referer: 'https://turbo.cr/' } : (isFilester ? { Referer: filesterRef } : { Referer: reflink });
 
-                const request = GM_xmlhttpRequest({
+                const request = xfpdGM_xmlhttpRequest({
                     url,
                     headers: reqHeaders,
                     responseType: 'blob',
@@ -7369,12 +7547,12 @@ if (isGoFile || isPixeldrain || isFilester) {
                         const totalSizeInMB = Number(response.total / 1024 / 1024).toFixed(2);
                         if (response.total === -1 || response.totalSize === -1) {
                             h.ui.setElProps(filePB, { width: '0%' });
-                            h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${host.name} 🢒 ${downloadedSizeInMB} MB 🢒 ${ellipsedUrl}`);
+                            h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${host.name} ${XFPD_STATUS_ARROW} ${downloadedSizeInMB} MB ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                         } else {
                             h.show(filePB);
                             h.ui.setText(
                                 statusLabel,
-                                `${completed} / ${totalDownloadable} 🢒 ${host.name} 🢒 ${downloadedSizeInMB} MB / ${totalSizeInMB} MB  🢒 ${ellipsedUrl}`,
+                                `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${host.name} ${XFPD_STATUS_ARROW} ${downloadedSizeInMB} MB / ${totalSizeInMB} MB  ${XFPD_STATUS_ARROW} ${ellipsedUrl}`,
                             );
                             h.ui.setElProps(filePB, {
                                 width: `${(response.loaded / response.total) * 100}%`,
@@ -7414,7 +7592,7 @@ if (isGoFile || isPixeldrain || isFilester) {
                         completed++;
                         completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7448,7 +7626,7 @@ if (isGoFile || isPixeldrain || isFilester) {
                                 completed++;
                                 completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7617,7 +7795,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                                     completed++;
                                     completedBatchedDownloads++;
 
-                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                    h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                     h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                     h.ui.setElProps(totalPB, {
                                         width: `${(completed / totalDownloadable) * 100}%`,
@@ -7630,7 +7808,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                                 completed++;
                                 completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7680,7 +7858,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                                 completed++;
                                 completedBatchedDownloads++;
 
-                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                                h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                                 h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                                 h.ui.setElProps(totalPB, {
                                     width: `${(completed / totalDownloadable) * 100}%`,
@@ -7696,7 +7874,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                         completed++;
                         completedBatchedDownloads++;
 
-                        h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                        h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                         h.ui.setElProps(statusLabel, { color: '#2d9053' });
                         h.ui.setElProps(totalPB, {
                             width: `${(completed / totalDownloadable) * 100}%`,
@@ -7974,7 +8152,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                         completed++;
                         completedBatchedDownloads++;
 
-                        h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} 🢒 ${ellipsedUrl}`);
+                        h.ui.setText(statusLabel, `${completed} / ${totalDownloadable} ${XFPD_STATUS_ARROW} ${ellipsedUrl}`);
                         h.ui.setElProps(statusLabel, { color: '#b23b3b' });
                         h.ui.setElProps(totalPB, {
                             width: `${(completed / totalDownloadable) * 100}%`,
@@ -8188,7 +8366,7 @@ if (needZipBlob) {
                     } else {
                         await new Promise(resolve => {
                             const url = URL.createObjectURL(blob);
-                            GM_download({
+                            xfpdGM_download({
                                 url,
                                 name: `${title}/#${postNumber}.zip`,
                                 onload: () => {
@@ -8215,7 +8393,7 @@ if (needZipBlob) {
                         } else {
                             await new Promise(resolve => {
                                 const url = URL.createObjectURL(blob);
-                                GM_download({
+                                xfpdGM_download({
                                     url,
                                     name: `${title}/#${postNumber}/generated.zip`,
                                     onload: () => {
@@ -8309,7 +8487,7 @@ const addDownloadPageButton = () => {
 
     const buttonTextSpan = document.createElement('span');
     buttonTextSpan.setAttribute('class', 'button-text download-page-btn');
-    buttonTextSpan.innerText = `🡳 Download Page`;
+    buttonTextSpan.innerText = XFPD_DOWNLOAD_PAGE_BUTTON_TEXT;
 
     downloadAllButton.appendChild(buttonTextSpan);
 
@@ -8498,7 +8676,7 @@ const selectedPosts = [];
             const { btn: btnDownloadPost } = ui.buttons.addDownloadPostButton(post);
             const totalResources = parsedHosts.reduce((acc, host) => acc + host.resources.length, 0);
             const checkedLength = getTotalDownloadableResourcesForPostCB(parsedHosts);
-            btnDownloadPost.innerHTML = `🡳 Download (${checkedLength}/${totalResources})`;
+            btnDownloadPost.textContent = `${XFPD_DOWNLOAD_BUTTON_TEXT} (${checkedLength}/${totalResources})`;
 
             // Create download status / progress elements.
             const { el: statusText } = ui.labels.status.createStatusLabel();
@@ -8518,7 +8696,7 @@ const selectedPosts = [];
                 tippyInstance.hide();
             };
 
-            ui.forms.config.post.createPostConfigForm(
+            const postConfigTooltip = ui.forms.config.post.createPostConfigForm(
                 parsedPost,
                 parsedHosts,
                 `#${parsedPost.postNumber}.zip`,
@@ -8556,6 +8734,21 @@ const selectedPosts = [];
 
             btnDownloadPost.addEventListener('click', e => {
                 e.preventDefault();
+
+                // Mobile: first tap opens the settings tooltip (there is no hover to open it
+                // with), second tap closes it and starts the download. Desktop just dismisses
+                // an open tooltip so it does not sit over the progress bars.
+                if (xfpdRuntime.isMobile && postConfigTooltip) {
+                    const isShown = !!(postConfigTooltip.state && postConfigTooltip.state.isShown);
+                    if (!isShown) {
+                        try { postConfigTooltip.show(); } catch (e2) {}
+                        return;
+                    }
+                    try { postConfigTooltip.hide(); } catch (e2) {}
+                } else if (postConfigTooltip && postConfigTooltip.state && postConfigTooltip.state.isShown) {
+                    try { postConfigTooltip.hide(); } catch (e2) {}
+                }
+
                 downloadPost(parsedPost, parsedHosts, getEnabledHostsCB, resolvers, getSettingsCB, statusUI, postDownloadCallbacks);
             });
         });
@@ -8595,7 +8788,7 @@ const selectedPosts = [];
 
                 const threadTitle = parsers.thread.parseTitle();
 
-                let defaultPostContent = textContent.trim().replace('​', '');
+                let defaultPostContent = textContent.trim().replace('\u200B', '');
 
                 const ellipsedText = h.limit(defaultPostContent === '' ? threadTitle : defaultPostContent, 20);
 
@@ -8614,10 +8807,13 @@ const selectedPosts = [];
                         const { postId, contentContainer } = post.parsedPost;
                         ui.tooltip(
                             `#post-content-${postId}`,
-                            `<div style="overflow-y: auto; background: #242323; padding: 16px; width: 500px; max-height: 500px">
+                            `<div style="overflow-y: auto; background: #242323; padding: 16px; width: ${xfpdRuntime.ui.previewWidth}; max-width: ${xfpdRuntime.ui.previewMaxWidth}; max-height: ${xfpdRuntime.ui.previewMaxHeight}; box-sizing: border-box;">
                           ${contentContainer.innerHTML}
                          </div>`,
-                            { placement: 'right', offset: [10, 15] },
+                            {
+                                placement: xfpdRuntime.isMobile ? 'bottom' : 'right',
+                                offset: xfpdRuntime.isMobile ? [0, 8] : [10, 15],
+                            },
                         );
 
                         document.querySelector(`#config-download-post-${postId}`).addEventListener('change', e => {
