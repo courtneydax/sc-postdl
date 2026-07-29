@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b01
+// @version 3.21.b02
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -2661,6 +2661,8 @@ const resolvers = [
 try {
     const strip = (s) => String(s || '').split('#')[0].split('?')[0];
     const bases = xfpdBunkrFilterBases([origin, 'https://bunkr.pk', 'https://bunkr.cr']);
+    // DIAGNOSTIC (b02): tracing why some /f/ links resolve to nothing and get downloaded as HTML.
+    console.log(`[Bunkr] resolve start: url=${cleanUrl} origin=${origin} id=${id} bases=${JSON.stringify(bases)}`);
 
     for (const base of bases) {
         const base0 = String(base || '').replace(/\/$/, '');
@@ -2677,11 +2679,16 @@ try {
             const dom = viewRes?.dom;
             const viewSource = viewRes?.source || '';
 
+            const cfHit = xfpdLooksLikeCfChallenge(viewSource, dom);
+            console.log(`[Bunkr] view ${viewUrl}: bytes=${viewSource.length} dom=${!!dom} cfChallenge=${cfHit}`);
+
             // If Cloudflare interstitial is active, don't capture a bogus "Just a moment..." title as a filename hint.
-            if (xfpdLooksLikeCfChallenge(viewSource, dom)) continue;
+            if (cfHit) continue;
 
             if (!bunkrDataId) {
                 bunkrDataId = dom?.querySelector?.('[data-file-id]')?.getAttribute?.('data-file-id') || null;
+                console.log(`[Bunkr] data-file-id from ${viewUrl}: ${bunkrDataId || 'NOT FOUND'}`
+                    + (bunkrDataId ? '' : ` (page mentions dl.bunkr link: ${/dl\.bunkr\.[a-z]+\/file\/\d+/i.test(viewSource)})`));
             }
 
             let title =
@@ -2723,7 +2730,10 @@ try {
                 };
 
                 const tryNewApi = async () => {
-                    if (!bunkrDataId) return null;
+                    if (!bunkrDataId) {
+                        console.log('[Bunkr] tryNewApi skipped: no data-file-id was found on any view page');
+                        return null;
+                    }
                     try {
                         const refererUrl = `https://get.bunkrr.su/file/${bunkrDataId}`;
                         const response = await http.post(
@@ -2737,11 +2747,13 @@ try {
                             }
                         );
                         const text = String(response?.source || '');
+                        console.log(`[Bunkr] api _001_v2 id=${bunkrDataId}: bytes=${text.length} head=${text.slice(0, 160)}`);
                         if (!text) return null;
                         const data = JSON.parse(text);
                         if (!data) return null;
 
                         let finalUrl = decodeFinalUrl(data);
+                        console.log(`[Bunkr] decoded final url: ${finalUrl || 'DECODE FAILED'}`);
                         if (!finalUrl || typeof finalUrl !== 'string') return null;
                         finalUrl = finalUrl.trim();
                         if (finalUrl.startsWith('//')) finalUrl = 'https:' + finalUrl;
@@ -2766,11 +2778,15 @@ try {
 
                         return finalUrl;
                     } catch (e) {
+                        console.log(`[Bunkr] tryNewApi threw: ${(e && e.message) || e}`);
                         return null;
                     }
                 };
 
                 const finalURL = await tryNewApi();
+                if (!finalURL) {
+                    console.log(`[Bunkr] UNRESOLVED -> falling back to the page URL, which will download as HTML: ${cleanUrl}`);
+                }
                 return finalURL || cleanUrl;
             } catch (error) {
                 console.error(error?.message || error);
