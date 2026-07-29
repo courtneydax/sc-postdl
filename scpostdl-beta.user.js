@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b02
+// @version 3.21.b03
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -2638,9 +2638,15 @@ const resolvers = [
             try {
                 const cleanUrl = String(url || '').split('#')[0];
 
+                // Legacy Bunkr CDN hosts no longer serve files directly: as of 2026-07-28,
+                // cdn*.bunkr.*/<name>.mp4 responds 301 -> bunkr.*/f/<slug>, an HTML page. So these
+                // links still need the metadata + signing flow, and must NOT be treated as final.
+                const isLegacyBunkrCdn = /^https?:\/\/(?:cdn\d*|stream)\.bunkrr?r?\./i.test(cleanUrl);
+
                 // If this already looks like a direct media file URL, keep it (don't call /api/vs).
                 // (CDN links usually include the real filename already.)
                 if (
+                    !isLegacyBunkrCdn &&
                     /\.(?:mp4|m4v|webm|mov|mkv|jpg|jpeg|png|gif|webp|zip|rar|7z|pdf)(?:$|\?)/i.test(cleanUrl) &&
                     !/\/(?:v|f|d)\//i.test(cleanUrl)
                 ) {
@@ -2660,9 +2666,13 @@ const resolvers = [
 // This lets us rename CDN GUID links back to the original filename.
 try {
     const strip = (s) => String(s || '').split('#')[0].split('?')[0];
-    const bases = xfpdBunkrFilterBases([origin, 'https://bunkr.pk', 'https://bunkr.cr']);
+    const bases = xfpdBunkrFilterBases(
+        isLegacyBunkrCdn
+            ? ['https://bunkr.cr', 'https://bunkr.pk']
+            : [origin, 'https://bunkr.pk', 'https://bunkr.cr']
+    );
     // DIAGNOSTIC (b02): tracing why some /f/ links resolve to nothing and get downloaded as HTML.
-    console.log(`[Bunkr] resolve start: url=${cleanUrl} origin=${origin} id=${id} bases=${JSON.stringify(bases)}`);
+    console.log(`[Bunkr] resolve start: url=${cleanUrl} origin=${origin} id=${id} legacyCdn=${isLegacyBunkrCdn} bases=${JSON.stringify(bases)}`);
 
     for (const base of bases) {
         const base0 = String(base || '').replace(/\/$/, '');
