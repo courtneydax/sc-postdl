@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm03
+// @version 3.21.vm04
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -1061,6 +1061,12 @@ const h = {
             return h.promise((resolve, reject) => {
                 let responseHeaders = null;
                 let request = null;
+                const wantsDocument = String(responseType || '').toLowerCase() === 'document';
+                // VM/TM diverge on `responseType: "document"`: Violentmonkey (at least on Firefox)
+                // leaves `responseText` unset and stringifies the Document, so JSON/text endpoints
+                // come back as "[object HTMLDocument]". Request as text and parse the DOM manually
+                // when the caller wants a document.
+                const gmResponseType = wantsDocument ? 'text' : responseType;
                 // Allow passing non-header request options via a special key in the headers object.
                 // This keeps the original function signature intact.
                 const hdrs = {
@@ -1073,7 +1079,7 @@ const h = {
                 request = http({
                     url,
                     method,
-                    responseType,
+                    responseType: gmResponseType,
                     data,
                     headers: hdrs,
                     ...(withCredentials ? { withCredentials: true, anonymous: false } : {}),
@@ -1098,11 +1104,35 @@ const h = {
                         callbacks && callbacks.onProgress && callbacks.onProgress({ request, response });
                     },
                     onload: response => {
-                        const { responseText, status } = response;
-                        const dom = response?.response;
+                        const status = response?.status;
+                        let source = '';
+                        if (typeof response?.responseText === 'string') {
+                            source = response.responseText;
+                        } else if (typeof response?.response === 'string') {
+                            source = response.response;
+                        } else if (!wantsDocument && !h.isNullOrUndef(response?.response)) {
+                            source = String(response.response);
+                        }
+
+                        let dom = null;
+                        if (wantsDocument) {
+                            const maybeDom = response?.response;
+                            if (maybeDom && typeof maybeDom.querySelector === 'function') {
+                                dom = maybeDom;
+                            } else if (source) {
+                                try {
+                                    dom = new DOMParser().parseFromString(source, 'text/html');
+                                } catch (e) {
+                                    dom = null;
+                                }
+                            }
+                        } else {
+                            dom = response?.response;
+                        }
+
                         const finalUrl = response.finalUrl || response.responseURL || '';
                         callbacks && callbacks.onLoad && callbacks.onLoad(response);
-                        resolve({ source: responseText, request, status, dom, responseHeaders, finalUrl });
+                        resolve({ source, request, status, dom, responseHeaders, finalUrl });
                     },
                     onerror: error => {
                         callbacks && callbacks.onError && callbacks.onError(error);
@@ -1128,8 +1158,8 @@ const h = {
      * @param headers
      * @returns {Promise<unknown>}
      */
-        post: (url, data = {}, callbacks = {}, headers = {}) => {
-            return h.promise(resolve => resolve(h.http.base('POST', url, callbacks, headers, data)));
+        post: (url, data = {}, callbacks = {}, headers = {}, responseType = 'document') => {
+            return h.promise(resolve => resolve(h.http.base('POST', url, callbacks, headers, data, responseType)));
         },
     },
     re: {
