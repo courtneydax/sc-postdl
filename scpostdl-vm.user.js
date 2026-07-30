@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm05
+// @version 3.21.vm06
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -663,14 +663,52 @@ function filesterTokenFromVUrl(u) {
     } catch (e) { return ''; }
 }
 
-function filesterBuildCandidates(token) {
+// Stream hosts, in probe order. Filester migrated its CDN to fscN.cdn.cr (2026-07), so those go
+// first. The legacy cacheN.filester.me set is kept as a fallback tail -- Filester had maintenance
+// recently and may restore them.
+//
+// Ordering matters more than membership here. As of 2026-07-29 cache2/3/4/5/7/8 are NXDOMAIN, which
+// costs nothing (instant failure), but cache1 and cache6 still resolve and then **accept the
+// connection and never answer** -- ~78s each against Chrome's socket timeout.
+const FILESTER_STREAM_HOSTS = [
+    'https://fsc1.cdn.cr',
+    'https://fsc2.cdn.cr',
+    'https://fsc3.cdn.cr',
+    // Legacy tail, cheapest-first: these six are NXDOMAIN today, so they fail instantly and cost
+    // nothing if Filester has not restored them.
+    'https://cache2.filester.me',
+    'https://cache3.filester.me',
+    'https://cache4.filester.me',
+    'https://cache5.filester.me',
+    'https://cache7.filester.me',
+    'https://cache8.filester.me',
+    // Last: these two resolve but black-hole the connection, so each costs a full probe timeout.
+    'https://cache6.filester.me',
+    'https://cache1.filester.me',
+];
+
+// Per-request deadline for a speculative probe, and a cap on the whole sweep. Both are load-bearing:
+// without them a single black-holing host stalls the entire resolution loop.
+const FILESTER_PROBE_TIMEOUT_MS = 8000;
+const FILESTER_PROBE_BUDGET_MS = 25000;
+// API/HTML steps are on the critical path (no fallback host to try), so they get a looser deadline.
+const FILESTER_API_TIMEOUT_MS = 20000;
+
+// `apiBase` first on Chrome: Tampermonkey downloads are more reliable started from the site origin,
+// since the redirects preserve a Filester referrer.
+function filesterStreamBases(apiBase) {
+    const base = String(apiBase || 'https://filester.me').replace(/\/$/, '');
+    const out = [];
+    if (!isFF) out.push(base);
+    for (const h of FILESTER_STREAM_HOSTS) out.push(h);
+    if (isFF) out.push(base);
+    return out.filter((v, i, a) => a.indexOf(v) === i);
+}
+
+function filesterBuildCandidates(token, apiBase) {
     const t = String(token || '').trim();
     if (!t) return [];
-    const order = [6, 1, 2, 3, 4, 5, 7, 8];
-    const out = [];
-    for (const n of order) out.push(`https://cache${n}.filester.me/v/${t}`);
-    out.push(`https://filester.me/v/${t}`);
-    return out;
+    return filesterStreamBases(apiBase).map(b => `${b}/v/${t}`);
 }
 
 // Bunkr filename hints (from /v/ pages)
@@ -1026,6 +1064,18 @@ const h = {
    */
     fnNoExt: path => path.trim().split('.').reverse().slice(1).reverse().join('.'),
     /**
+   * Extension without the dot, or '' if there isn't one. Counterpart to fnNoExt.
+   * This was referenced by the duplicate-filename path but never actually defined, so any post with
+   * two same-named files threw "h.extension is not a function" and killed the download.
+   * @param path
+   * @returns {string}
+   */
+    extension: (path) => {
+        const base = String(path || '').trim().split('/').pop();
+        const m = /\.([A-Za-z0-9]{1,8})$/.exec(base);
+        return m && m[1] ? m[1] : '';
+    },
+    /**
    * @param path
    * @returns {unknown}
    */
@@ -1240,6 +1290,10 @@ const h = {
                 };
                 const withCredentials = !!(hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_withCredentials') && hdrs.__xfpd_withCredentials);
                 try { if (hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_withCredentials')) delete hdrs.__xfpd_withCredentials; } catch (e) {}
+                // Opt-in deadline. Without one a request that connects but never answers leaves this
+                // promise pending forever, which wedges the whole resolution loop (no error, no retry).
+                const timeoutMs = Number((hdrs && hdrs.__xfpd_timeout) || 0) || 0;
+                try { if (hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_timeout')) delete hdrs.__xfpd_timeout; } catch (e) {}
 
                 request = http({
                     url,
@@ -1248,6 +1302,13 @@ const h = {
                     data,
                     headers: hdrs,
                     ...(withCredentials ? { withCredentials: true, anonymous: false } : {}),
+                    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+                    // Resolve empty rather than reject: callers all read `(r && r.source) || ''`, so a
+                    // timed-out step degrades into "no data" and the resolver moves on to its fallback.
+                    ontimeout: () => {
+                        try { callbacks && callbacks.onTimeout && callbacks.onTimeout(); } catch (e) {}
+                        resolve({ source: '', request, status: 0, dom: null, responseHeaders, finalUrl: '', timedOut: true });
+                    },
                     onreadystatechange: response => {
                         if (response.readyState === 2) {
                             responseHeaders = response.responseHeaders;
@@ -5249,14 +5310,25 @@ if (page === 1) {
                 const parts = String(u.pathname || '').split('/').filter(Boolean);
                 return parts.length ? parts[parts.length - 1] : '';
             } catch (e) {
+                // Group 1 is the TLD, group 2 is the slug. This returned m[1] and so yielded
+                // "si"/"gg" as the slug for scheme-less links, which then collapsed every filename
+                // to Filester_si.bin and made them all collide.
                 const m = /filester\.(me|sh|si|gg)\/d\/([^\/?#]+)/i.exec(String(url || ''));
-                return m && m[1] ? m[1] : '';
+                return m && m[2] ? m[2] : '';
             }
         })();
 
         if (!slug) return null;
 
-        const apiBase = 'https://filester.me';
+        // The URL patterns accept .me/.sh/.si/.gg, so follow whichever domain the post actually links
+        // to rather than forcing every API call at .me.
+        const apiBase = (() => {
+            try {
+                const u = new URL(url);
+                if (/^(?:[a-z0-9-]+\.)*filester\.(me|sh|si|gg)$/i.test(u.hostname)) return `https://${u.hostname}`;
+            } catch (e) {}
+            return 'https://filester.me';
+        })();
 
         const mkHeaders = () => ({
             Accept: 'application/json, text/plain, */*',
@@ -5264,6 +5336,7 @@ if (page === 1) {
             Origin: apiBase,
             Referer: url,
             __xfpd_withCredentials: true,
+            __xfpd_timeout: FILESTER_API_TIMEOUT_MS,
         });
 
         const safeJson = (txt) => {
@@ -5506,7 +5579,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                     'GET',
                     probeUrl,
                     { onResponseHeadersReceieved: () => {} },
-                    { Range: 'bytes=0-0', Referer: `${apiBase}/`, __xfpd_withCredentials: true },
+                    { Range: 'bytes=0-0', Referer: `${apiBase}/`, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_PROBE_TIMEOUT_MS },
                     null,
                     'text',
                 );
@@ -5548,7 +5621,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                     'GET',
                     tokenUrl,
                     {},
-                    { Range: 'bytes=0-0', Referer: ref, __xfpd_withCredentials: true },
+                    { Range: 'bytes=0-0', Referer: ref, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
                     null,
                     'text',
                 );
@@ -5571,7 +5644,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                         'GET',
                         tokenUrl,
                         {},
-                        { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', Referer: ref, __xfpd_withCredentials: true },
+                        { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', Referer: ref, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
                         null,
                         'text',
                     );
@@ -5599,6 +5672,61 @@ const filesterParseDispositionFilename = (headersRaw) => {
             }
         };
 
+        // --- v2 API (current) ---------------------------------------------------------------
+        // Filester came back from its outage on a v2 public API and a new CDN. Everything below this
+        // block talks to the old /api/public/* endpoints, which still answer 200 but hand back a
+        // legacy-shaped payload whose server/download_url combination now 404s -- which is why
+        // downloads were failing with "blocked/tiny response" while resolution looked like it worked.
+        //
+        // Per the site's own /js/file_dl.js:
+        //   POST {origin}/v2/api/public/download  {file_slug}
+        //     -> { server, file: "<uuid>.<ext>", token, name, expires_in }
+        //   URL = `${server}/v2/${file}?token=${token}&download=true&n=${name}`
+        // The response carries the real filename, so this also removes the Filester_<slug>.bin
+        // guessing entirely. Tokens are IP-bound and expire in ~30 min.
+        try {
+            if (progressCB) progressCB('[Filester] Requesting download token (v2)...');
+            const v2Res = await http.base(
+                'POST',
+                `${apiBase}/v2/api/public/download`,
+                {},
+                mkHeaders(),
+                JSON.stringify({ file_slug: slug }),
+                'text',
+            );
+
+            const v2Json = safeJson(v2Res && v2Res.source);
+            const v2Server = String((v2Json && v2Json.server) || '').replace(/\/$/, '');
+            const v2File = String((v2Json && v2Json.file) || '');
+            const v2Token = String((v2Json && v2Json.token) || '');
+            const v2Name = String((v2Json && v2Json.name) || '');
+
+            if (v2Server && v2File && v2Token) {
+                let v2Url = `${v2Server}/v2/${encodeURI(v2File)}?token=${encodeURIComponent(v2Token)}&download=true`;
+                if (v2Name) v2Url += `&n=${encodeURIComponent(v2Name)}`;
+
+                const finalName = v2Name || `Filester_${slug}${(/\.[A-Za-z0-9]{1,8}$/.exec(v2File) || [''])[0]}`;
+
+                try { filesterSlugByUrl.set(String(v2Url), String(slug)); } catch (e) {}
+                try {
+                    filesterNameBySlug.set(String(slug), String(finalName));
+                    filesterNameByUrl.set(String(v2Url), String(finalName));
+                    filesterNameByUrl.set(String(url), String(finalName));
+                } catch (e) {}
+                // The CDN wants a Filester referer; the /d/ page is the one the site itself uses.
+                try {
+                    const ref2 = `${apiBase}/d/${slug}`;
+                    filesterRefByUrl.set(String(v2Url), ref2);
+                    filesterRefByUrl.set(String(url), ref2);
+                } catch (e) {}
+
+                return v2Url;
+            }
+        } catch (e) {}
+
+        // --- legacy v1 fallback -------------------------------------------------------------
+        // Kept in case v2 is unavailable for a given file or domain. Everything from here down is
+        // the pre-outage flow.
         try {
             if (progressCB) progressCB('[Filester] Fetching metadata...');
             const viewRes = await http.base(
@@ -5649,7 +5777,7 @@ try {
             'GET',
             slugPageUrl,
             {},
-            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true },
+            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
             {},
             'text',
         );
@@ -5697,7 +5825,7 @@ try {
             'GET',
             viewPageUrl,
             {},
-            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true },
+            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
             {},
             'text',
         );
@@ -5823,74 +5951,10 @@ try {
             }
         } catch (e) {}
 
-// Prefer the cache /v/ stream URL. The /d/ token often requires a Filester referer (otherwise it returns not_whitelisted).
-        try {
-            if (relViewPath && /^\/v\//i.test(String(relViewPath))) {
-                if (progressCB) progressCB('[Filester] Probing cache stream URL...');
-                const bases = [];
-                // Chrome Tampermonkey downloads are more reliable when starting from filester.me (redirects preserve a Filester referrer).
-                if (!isFF) bases.push(apiBase);
-                bases.push('https://cache6.filester.me');
-                for (let i = 1; i <= 8; i++) if (i !== 6) bases.push(`https://cache${i}.filester.me`);
-                if (isFF) bases.push(apiBase);
-
-                let streamUrl = null;
-                let streamCt = '';
-                let streamSize = 0;
-                let streamHdrName = '';
-
-                for (const base of bases) {
-                    const cand = String(base).replace(/\/$/, '') + String(relViewPath);
-                    const p = await filesterProbe(cand);
-                    if (p && p.ok) {
-                        streamUrl = cand;
-                        streamCt = String(p.contentType || '');
-                        streamSize = Number(p.size || 0) || 0;
-                        streamHdrName = String((p && p.fileName) || '');
-                        break;
-                    }
-                }
-
-                if (streamUrl) {
-                    try { filesterSlugByUrl.set(String(streamUrl), String(slug)); } catch (e) {}
-                    try {
-                        const ref0 = (relViewPath ? `${apiBase}${relViewPath}` : `${apiBase}/d/${slug}`);
-                        if (ref0 && String(ref0).startsWith('http')) {
-                            filesterRefByUrl.set(String(streamUrl), String(ref0));
-                            filesterRefByUrl.set(String(url), String(ref0));
-                            filesterRefByUrl.set(`${apiBase}/d/${slug}`, String(ref0));
-                        }
-                    } catch (e) {}
-                    try { if (!nameHint && streamHdrName) nameHint = String(streamHdrName); } catch (e) {}
-                    const ext = filesterExtFromCt(streamCt);
-                    let finalName = '';
-                    try { if (nameHint) finalName = String(nameHint); } catch (e) {}
-                    if (!finalName) finalName = `Filester_${slug}.${ext || 'bin'}`;
-                    try {
-                        const hasExt = /\.[A-Za-z0-9]{1,8}$/.test(String(finalName || ''));
-                        if (!hasExt && ext) finalName = `${finalName}.${ext}`;
-                    } catch (e) {}
-
-                    try {
-                        filesterNameBySlug.set(String(slug), String(finalName));
-                        filesterNameByUrl.set(String(streamUrl), String(finalName));
-                    try { filesterNameByUrl.set(String(url), String(finalName)); } catch (e) {}
-                    try { filesterNameByUrl.set(`${apiBase}/d/${slug}`, String(finalName)); } catch (e) {}
-                    try { if (relViewPath) filesterNameByUrl.set(`${apiBase}${relViewPath}`, String(finalName)); } catch (e) {}
-
-                    } catch (e) {}
-                    if (streamSize) {
-                        try {
-                            filesterSizeBySlug.set(String(slug), Number(streamSize));
-                            filesterSizeByUrl.set(String(streamUrl), Number(streamSize));
-                        } catch (e) {}
-                    }
-
-                    return streamUrl;
-                }
-            }
-        } catch (e) {}
-
+        // Authoritative and fast: /api/public/download returns the current CDN URL directly (today
+        // an fscN.cdn.cr one). This runs *before* the speculative host sweep below, because that
+        // sweep guesses at which host serves /v/<token> and the new CDN does not use that path at
+        // all -- so it always failed, after burning its whole budget on hosts that never answer.
         try {
             if (progressCB) progressCB('[Filester] Resolving download URL...');
             const dlRes = await http.base(
@@ -5959,6 +6023,78 @@ try {
                     filesterSizeByUrl.set(String(dlUrl), Number(sizeHint));
                 }
                 return dlUrl;
+            }
+        } catch (e) {}
+
+        // Fallback only: probe for a /v/ stream URL by guessing the host. Still worth keeping for
+        // the case where the download API is blocked or rate-limited, and because the /d/ token can
+        // require a Filester referer (otherwise it returns not_whitelisted). Bounded by
+        // FILESTER_PROBE_BUDGET_MS since most candidates are currently dead or black holes.
+        try {
+            if (relViewPath && /^\/v\//i.test(String(relViewPath))) {
+                if (progressCB) progressCB('[Filester] Probing cache stream URL...');
+                const bases = filesterStreamBases(apiBase);
+
+                let streamUrl = null;
+                let streamCt = '';
+                let streamSize = 0;
+                let streamHdrName = '';
+
+                // Hard budget for the whole sweep. The authoritative /api/public/download call above
+                // has already failed if we are here, so this is pure guesswork -- worth a few seconds,
+                // never worth minutes.
+                const probeDeadline = Date.now() + FILESTER_PROBE_BUDGET_MS;
+
+                for (const base of bases) {
+                    if (Date.now() > probeDeadline) break;
+                    const cand = String(base).replace(/\/$/, '') + String(relViewPath);
+                    const p = await filesterProbe(cand);
+                    if (p && p.ok) {
+                        streamUrl = cand;
+                        streamCt = String(p.contentType || '');
+                        streamSize = Number(p.size || 0) || 0;
+                        streamHdrName = String((p && p.fileName) || '');
+                        break;
+                    }
+                }
+
+                if (streamUrl) {
+                    try { filesterSlugByUrl.set(String(streamUrl), String(slug)); } catch (e) {}
+                    try {
+                        const ref0 = (relViewPath ? `${apiBase}${relViewPath}` : `${apiBase}/d/${slug}`);
+                        if (ref0 && String(ref0).startsWith('http')) {
+                            filesterRefByUrl.set(String(streamUrl), String(ref0));
+                            filesterRefByUrl.set(String(url), String(ref0));
+                            filesterRefByUrl.set(`${apiBase}/d/${slug}`, String(ref0));
+                        }
+                    } catch (e) {}
+                    try { if (!nameHint && streamHdrName) nameHint = String(streamHdrName); } catch (e) {}
+                    const ext = filesterExtFromCt(streamCt);
+                    let finalName = '';
+                    try { if (nameHint) finalName = String(nameHint); } catch (e) {}
+                    if (!finalName) finalName = `Filester_${slug}.${ext || 'bin'}`;
+                    try {
+                        const hasExt = /\.[A-Za-z0-9]{1,8}$/.test(String(finalName || ''));
+                        if (!hasExt && ext) finalName = `${finalName}.${ext}`;
+                    } catch (e) {}
+
+                    try {
+                        filesterNameBySlug.set(String(slug), String(finalName));
+                        filesterNameByUrl.set(String(streamUrl), String(finalName));
+                    try { filesterNameByUrl.set(String(url), String(finalName)); } catch (e) {}
+                    try { filesterNameByUrl.set(`${apiBase}/d/${slug}`, String(finalName)); } catch (e) {}
+                    try { if (relViewPath) filesterNameByUrl.set(`${apiBase}${relViewPath}`, String(finalName)); } catch (e) {}
+
+                    } catch (e) {}
+                    if (streamSize) {
+                        try {
+                            filesterSizeBySlug.set(String(slug), Number(streamSize));
+                            filesterSizeByUrl.set(String(streamUrl), Number(streamSize));
+                        } catch (e) {}
+                    }
+
+                    return streamUrl;
+                }
             }
         } catch (e) {}
 
