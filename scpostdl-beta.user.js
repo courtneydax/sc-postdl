@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b06
+// @version 3.21.b07
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -470,6 +470,92 @@ function filesterBuildCandidates(token, apiBase) {
     const t = String(token || '').trim();
     if (!t) return [];
     return filesterStreamBases(apiBase).map(b => `${b}/v/${t}`);
+}
+
+// Filester v2 public API -- the only resolver that still works. The v1 /api/public/download
+// endpoint keeps answering 200 with a legacy-shaped payload whose /v/<token> URL now 404s on every
+// CDN host, so anything still calling it silently produces dead links.
+//   POST {apiBase}/v2/api/public/download  {file_slug}
+//     -> { server, file: "<uuid>.<ext>", token, name, expires_in }
+//   URL = `${server}/v2/${file}?token=${token}&download=true&n=${name}`
+// `server` is whichever host Filester picks (fsc1/fsc2/fsc3.cdn.cr today, and it does vary per
+// request) -- take it as given rather than validating it against a known-host list, which is what
+// broke a third-party build when fsc3 started appearing. There is no host ladder to walk here:
+// the token is only valid for the server that issued it, so `filesterBuildCandidates` must not be
+// used on a v2 URL.
+//
+// Shared by the /d/ link resolver and by the download-time resolver for album (/f/) slugs. The
+// latter used to carry its own v1 copy of this, which is why single links worked while albums
+// still fell back to fscN.cdn.cr/v/<token> and 404'd.
+//
+// Tokens are IP-bound and expire in ~30 min, so callers should resolve as late as possible.
+async function filesterResolveV2(http, apiBase, slug, progressCB) {
+    const base = String(apiBase || 'https://filester.me').replace(/\/$/, '');
+    const s = String(slug || '').trim();
+    if (!s) return null;
+
+    try {
+        if (typeof progressCB === 'function') progressCB('[Filester] Requesting download token (v2)...');
+
+        const res = await http.base(
+            'POST',
+            `${base}/v2/api/public/download`,
+            {},
+            {
+                Accept: 'application/json, text/plain, */*',
+                'Content-Type': 'application/json;charset=UTF-8',
+                Origin: base,
+                Referer: `${base}/d/${s}`,
+                __xfpd_withCredentials: true,
+                __xfpd_timeout: FILESTER_API_TIMEOUT_MS,
+            },
+            JSON.stringify({ file_slug: s }),
+            'text',
+        );
+
+        let j = null;
+        try { j = JSON.parse(String((res && res.source) || '')); } catch (e) {}
+
+        const server = String((j && j.server) || '').replace(/\/$/, '');
+        const file = String((j && j.file) || '');
+        const token = String((j && j.token) || '');
+        const name = String((j && j.name) || '');
+        if (!server || !file || !token) return null;
+
+        // Encode per path segment, not with encodeURI: encodeURI leaves `#` alone, which would
+        // truncate the URL at the fragment. `file` is "<uuid>.<ext>" today, so this normally
+        // changes nothing -- it just stops a stray character from silently killing the download.
+        const filePath = String(file).split('/').map(encodeURIComponent).join('/');
+        let streamUrl = `${server}/v2/${filePath}?token=${encodeURIComponent(token)}&download=true`;
+        if (name) streamUrl += `&n=${encodeURIComponent(name)}`;
+
+        // The response carries the real filename, so there is no extension guessing to do beyond
+        // the (rare) case of a nameless response.
+        const finalName = name || `Filester_${s}${(/\.[A-Za-z0-9]{1,8}$/.exec(file) || [''])[0]}`;
+        // The CDN wants a Filester referer; the /d/ page is the one the site itself uses.
+        const ref = `${base}/d/${s}`;
+
+        try { filesterSlugByUrl.set(String(streamUrl), String(s)); } catch (e) {}
+        try { filesterRefByUrl.set(String(streamUrl), String(ref)); } catch (e) {}
+        try {
+            filesterNameBySlug.set(String(s), String(finalName));
+            filesterNameByUrl.set(String(streamUrl), String(finalName));
+        } catch (e) {}
+
+        return { url: streamUrl, name: finalName, ref, token, server, file };
+    } catch (e) {}
+
+    return null;
+}
+
+// A resolved Filester stream URL lives on a CDN host we do not control the naming of, so recognise
+// it by the slug map we populate at resolution time rather than by hostname -- pattern-matching
+// fscN.cdn.cr would break again the next time Filester renames its CDN.
+function isFilesterUrl(u) {
+    const s = String(u || '');
+    if (/(?:^|\/\/)(?:[a-z0-9-]+\.)*filester\.(me|sh|si|gg)\/(?:d|v)\//i.test(s)) return true;
+    try { if (filesterSlugByUrl.has(s)) return true; } catch (e) {}
+    return false;
 }
 
 // Bunkr filename hints (from /v/ pages)
@@ -5392,50 +5478,16 @@ const filesterParseDispositionFilename = (headersRaw) => {
         // block talks to the old /api/public/* endpoints, which still answer 200 but hand back a
         // legacy-shaped payload whose server/download_url combination now 404s -- which is why
         // downloads were failing with "blocked/tiny response" while resolution looked like it worked.
-        //
-        // Per the site's own /js/file_dl.js:
-        //   POST {origin}/v2/api/public/download  {file_slug}
-        //     -> { server, file: "<uuid>.<ext>", token, name, expires_in }
-        //   URL = `${server}/v2/${file}?token=${token}&download=true&n=${name}`
-        // The response carries the real filename, so this also removes the Filester_<slug>.bin
-        // guessing entirely. Tokens are IP-bound and expire in ~30 min.
+        // See filesterResolveV2 for the endpoint shape; it is shared with the album (/f/) path,
+        // which resolves its slugs at download time rather than here.
         try {
-            if (progressCB) progressCB('[Filester] Requesting download token (v2)...');
-            const v2Res = await http.base(
-                'POST',
-                `${apiBase}/v2/api/public/download`,
-                {},
-                mkHeaders(),
-                JSON.stringify({ file_slug: slug }),
-                'text',
-            );
-
-            const v2Json = safeJson(v2Res && v2Res.source);
-            const v2Server = String((v2Json && v2Json.server) || '').replace(/\/$/, '');
-            const v2File = String((v2Json && v2Json.file) || '');
-            const v2Token = String((v2Json && v2Json.token) || '');
-            const v2Name = String((v2Json && v2Json.name) || '');
-
-            if (v2Server && v2File && v2Token) {
-                let v2Url = `${v2Server}/v2/${encodeURI(v2File)}?token=${encodeURIComponent(v2Token)}&download=true`;
-                if (v2Name) v2Url += `&n=${encodeURIComponent(v2Name)}`;
-
-                const finalName = v2Name || `Filester_${slug}${(/\.[A-Za-z0-9]{1,8}$/.exec(v2File) || [''])[0]}`;
-
-                try { filesterSlugByUrl.set(String(v2Url), String(slug)); } catch (e) {}
-                try {
-                    filesterNameBySlug.set(String(slug), String(finalName));
-                    filesterNameByUrl.set(String(v2Url), String(finalName));
-                    filesterNameByUrl.set(String(url), String(finalName));
-                } catch (e) {}
-                // The CDN wants a Filester referer; the /d/ page is the one the site itself uses.
-                try {
-                    const ref2 = `${apiBase}/d/${slug}`;
-                    filesterRefByUrl.set(String(v2Url), ref2);
-                    filesterRefByUrl.set(String(url), ref2);
-                } catch (e) {}
-
-                return v2Url;
+            const v2 = await filesterResolveV2(http, apiBase, slug, progressCB);
+            if (v2 && v2.url) {
+                // filesterResolveV2 keys its hints off the resolved URL; the original /d/ URL needs
+                // the same name and referer so later lookups on it agree.
+                try { filesterNameByUrl.set(String(url), String(v2.name)); } catch (e) {}
+                try { filesterRefByUrl.set(String(url), String(v2.ref)); } catch (e) {}
+                return v2.url;
             }
         } catch (e) {}
 
@@ -6787,70 +6839,42 @@ if (tmp.length) {
                     } catch (e) {}
                 }
 
-                // Filester: turn short /d/<slug> view URLs into cache /v/<token> stream URLs (no tabs).
-                // Album pages (/f/...) mostly contain only short slugs, which require this token step.
+                // Filester: turn short /d/<slug> view URLs into v2 CDN stream URLs (no tabs).
+                // Album pages (/f/...) only ever yield short slugs, so this is the step that makes
+                // album downloads work at all -- the /d/ link resolver never sees them.
+                //
+                // This used to call the v1 /api/public/download endpoint and build
+                // `${host}/v/${token}` candidates from it. v1 still answers 200, so resolution
+                // looked fine, but every one of those URLs 404s on the current CDN -- which is why
+                // single /d/ links worked from b06 while albums kept retrying fsc1/fsc2/fsc3 and
+                // failing. Resolution now goes through the same v2 resolver as single links.
                 if (isFilester) {
                     try {
                         const uF = new URL(String(url || ''));
                         const isFilesterD = /(^|\.)filester\.(me|sh|si|gg)$/i.test(String(uF.host || '')) && /^\/d\//i.test(String(uF.pathname || ''));
                         if (isFilesterD) {
                             const slug = String(uF.pathname || '').split('/').filter(Boolean).pop() || '';
-                            // Short slugs look like "d8ZdCxc" / "QnUVP6A" etc.
-                            const looksLikeShortSlug = /^[A-Za-z0-9]{6,12}$/.test(slug);
-                            if (looksLikeShortSlug) {
-                                const apiRes = await h.http.base(
-                                    'POST',
-                                    'https://filester.me/api/public/download',
-                                    {},
-                                    {
-                                        Accept: 'application/json, text/plain, */*',
-                                        'Content-Type': 'application/json',
-                                        Origin: 'https://filester.me',
-                                        Referer: `https://filester.me/d/${slug}`,
-                                        __xfpd_withCredentials: true,
-                                    },
-                                    JSON.stringify({ file_slug: slug }),
-                                    'text',
-                                );
+                            // Slugs look like "d8ZdCxc" / "QnUVP6A". The bound is deliberately loose
+                            // -- anything path-shaped under /d/ on a Filester host is a slug, and a
+                            // tight length check would silently skip resolution and save the HTML
+                            // view page instead.
+                            const looksLikeSlug = /^[A-Za-z0-9_-]{4,64}$/.test(slug);
+                            if (looksLikeSlug) {
+                                // Follow whichever Filester domain the post linked to.
+                                const apiBase = `https://${String(uF.host || 'filester.me')}`;
+                                const v2 = await filesterResolveV2(h.http, apiBase, slug);
 
-                                const txt = String((apiRes && apiRes.source) || '');
-                                let j = null;
-                                try { j = JSON.parse(txt); } catch (e) {}
-
-                                let token = '';
-                                try { if (j && typeof j.token === 'string') token = String(j.token).trim(); } catch (e) {}
-                                if (!token) {
-                                    try {
-                                        const rel = j && (j.download_url || j.downloadUrl || j.url);
-                                        if (typeof rel === 'string' && rel.trim()) {
-                                            const m = /\/d\/([^\/?#]+)/i.exec(String(rel));
-                                            if (m && m[1]) token = String(m[1]).trim();
-                                        }
-                                    } catch (e) {}
-                                }
-                                if (!token) {
-                                    const m2 = /"token"\s*:\s*"([^"]+)"/i.exec(txt);
-                                    if (m2 && m2[1]) token = String(m2[1]).trim();
-                                }
-
-                                if (token) {
-                                    const candidates = filesterBuildCandidates(token);
-                                    const streamUrl = (candidates && candidates.length) ? candidates[0] : `https://cache6.filester.me/v/${token}`;
-                                    try { filesterCandidatesByToken.set(String(token), candidates); } catch (e) {}
-                                    try {
-                                        for (const c of (candidates || [])) {
-                                            try { filesterSlugByUrl.set(String(c), String(slug)); } catch (e) {}
-                                            try { filesterRefByUrl.set(String(c), 'https://filester.me/'); } catch (e) {}
-                                        }
-                                    } catch (e) {}
+                                if (v2 && v2.url) {
+                                    const streamUrl = String(v2.url);
                                     if (!filesterNoTabTokenLogged) {
                                         filesterNoTabTokenLogged = true;
-                                        log.post.info(postId, `::Filester slug->token->cache (no tab)::: ${slug} -> ${streamUrl}`, postNumber);
+                                        log.post.info(postId, `::Filester slug->v2 token (no tab)::: ${slug} -> ${streamUrl}`, postNumber);
                                     }
 
-                                    try { filesterSlugByUrl.set(String(streamUrl), String(slug)); } catch (e) {}
-                                    try { filesterRefByUrl.set(String(streamUrl), 'https://filester.me/'); } catch (e) {}
-                                    try { filesterRefByUrl.set(String(url), 'https://filester.me/'); } catch (e) {}
+                                    // filesterResolveV2 already recorded the slug/name/referer for
+                                    // the new URL; the /d/ URL still needs its referer mapped so a
+                                    // later fallback to it uses a Filester referer too.
+                                    try { filesterRefByUrl.set(String(url), String(v2.ref)); } catch (e) {}
                                     url = streamUrl;
                                     try { resource.url = streamUrl; } catch (e) {}
                                 }
@@ -6880,8 +6904,11 @@ if (tmp.length) {
                 if (url.includes('turbocdn.st')){
                     reflink = "https://turbo.cr/"
                 }
-                if (/(?:\bfilester\.(me|sh|si|gg)\b|cache\d+\.filester\.(me|sh|si|gg))/i.test(String(url || ''))){
-                    reflink = "https://filester.me/"
+                if (isFilesterUrl(url)){
+                    // Prefer the exact /d/ page the token was issued against; the CDN accepts any
+                    // Filester referer, but a v2 stream URL is not on a filester.* host at all, so
+                    // the old hostname test never fired for it.
+                    reflink = String(filesterRefByUrl.get(String(url)) || "https://filester.me/")
                 }
 
 
@@ -7875,7 +7902,7 @@ const isView = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\//i.test(String(
                         }
 
                         // Filester: prefer the real filename (from view page / API hints). Only fall back to a safe slug-based name when needed.
-                        if (/(?:^|https?:\/\/)(?:cache\d+\.)?filester\.(me|sh|si|gg)\/(?:d|v)\//i.test(String(url || ''))) {
+                        if (isFilesterUrl(url)) {
                             try {
                                 let slug0 = '';
                                 const m = /https?:\/\/(?:www\.)?filester\.(me|sh|si|gg)\/d\/([^\/?#]+)/i.exec(String((resource && resource.original) || ''));
