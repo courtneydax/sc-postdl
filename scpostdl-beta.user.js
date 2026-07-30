@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b04
+// @version 3.21.b05
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -422,14 +422,54 @@ function filesterTokenFromVUrl(u) {
     } catch (e) { return ''; }
 }
 
-function filesterBuildCandidates(token) {
+// Stream hosts, in probe order. Filester migrated its CDN to fscN.cdn.cr (2026-07), so those go
+// first. The legacy cacheN.filester.me set is kept as a fallback tail — Filester had maintenance
+// recently and may restore them.
+//
+// Ordering matters more than membership here. As of 2026-07-29 cache2/3/4/5/7/8 are NXDOMAIN, which
+// costs nothing (instant failure), but cache1 and cache6 still resolve and then **accept the
+// connection and never answer** — ~78s each against Chrome's socket timeout. Two of those in the old
+// order (apiBase, cache6, cache1, ...) is exactly the ~157s per link that was observed.
+const FILESTER_STREAM_HOSTS = [
+    'https://fsc1.cdn.cr',
+    'https://fsc2.cdn.cr',
+    'https://fsc3.cdn.cr',
+    // Legacy tail, cheapest-first: these six are NXDOMAIN today, so they fail instantly and cost
+    // nothing if Filester has not restored them.
+    'https://cache2.filester.me',
+    'https://cache3.filester.me',
+    'https://cache4.filester.me',
+    'https://cache5.filester.me',
+    'https://cache7.filester.me',
+    'https://cache8.filester.me',
+    // Last: these two resolve but black-hole the connection, so each costs a full probe timeout.
+    // Kept only so they start working again by themselves if Filester brings them back.
+    'https://cache6.filester.me',
+    'https://cache1.filester.me',
+];
+
+// Per-request deadline for a speculative probe, and a cap on the whole sweep. Both are load-bearing:
+// without them a single black-holing host stalls the entire resolution loop.
+const FILESTER_PROBE_TIMEOUT_MS = 8000;
+const FILESTER_PROBE_BUDGET_MS = 25000;
+// API/HTML steps are on the critical path (no fallback host to try), so they get a looser deadline.
+const FILESTER_API_TIMEOUT_MS = 20000;
+
+// `apiBase` first on Chrome: Tampermonkey downloads are more reliable started from the site origin,
+// since the redirects preserve a Filester referrer.
+function filesterStreamBases(apiBase) {
+    const base = String(apiBase || 'https://filester.me').replace(/\/$/, '');
+    const out = [];
+    if (!isFF) out.push(base);
+    for (const h of FILESTER_STREAM_HOSTS) out.push(h);
+    if (isFF) out.push(base);
+    return out.filter((v, i, a) => a.indexOf(v) === i);
+}
+
+function filesterBuildCandidates(token, apiBase) {
     const t = String(token || '').trim();
     if (!t) return [];
-    const order = [6, 1, 2, 3, 4, 5, 7, 8];
-    const out = [];
-    for (const n of order) out.push(`https://cache${n}.filester.me/v/${t}`);
-    out.push(`https://filester.me/v/${t}`);
-    return out;
+    return filesterStreamBases(apiBase).map(b => `${b}/v/${t}`);
 }
 
 // Bunkr filename hints (from /v/ pages)
@@ -993,6 +1033,10 @@ const h = {
                 };
                 const withCredentials = !!(hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_withCredentials') && hdrs.__xfpd_withCredentials);
                 try { if (hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_withCredentials')) delete hdrs.__xfpd_withCredentials; } catch (e) {}
+                // Opt-in deadline. Without one a request that connects but never answers leaves this
+                // promise pending forever, which wedges the whole resolution loop (no error, no retry).
+                const timeoutMs = Number((hdrs && hdrs.__xfpd_timeout) || 0) || 0;
+                try { if (hdrs && Object.prototype.hasOwnProperty.call(hdrs, '__xfpd_timeout')) delete hdrs.__xfpd_timeout; } catch (e) {}
 
                 request = http({
                     url,
@@ -1001,6 +1045,13 @@ const h = {
                     data,
                     headers: hdrs,
                     ...(withCredentials ? { withCredentials: true, anonymous: false } : {}),
+                    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+                    // Resolve empty rather than reject: callers all read `(r && r.source) || ''`, so a
+                    // timed-out step degrades into "no data" and the resolver moves on to its fallback.
+                    ontimeout: () => {
+                        try { callbacks && callbacks.onTimeout && callbacks.onTimeout(); } catch (e) {}
+                        resolve({ source: '', request, status: 0, dom: null, responseHeaders, finalUrl: '', timedOut: true });
+                    },
                     onreadystatechange: response => {
                         if (response.readyState === 2) {
                             responseHeaders = response.responseHeaders;
@@ -4969,7 +5020,15 @@ if (page === 1) {
 
         if (!slug) return null;
 
-        const apiBase = 'https://filester.me';
+        // The URL patterns accept .me/.sh/.si/.gg, so follow whichever domain the post actually links
+        // to rather than forcing every API call at .me.
+        const apiBase = (() => {
+            try {
+                const u = new URL(url);
+                if (/^(?:[a-z0-9-]+\.)*filester\.(me|sh|si|gg)$/i.test(u.hostname)) return `https://${u.hostname}`;
+            } catch (e) {}
+            return 'https://filester.me';
+        })();
 
         const mkHeaders = () => ({
             Accept: 'application/json, text/plain, */*',
@@ -4977,6 +5036,7 @@ if (page === 1) {
             Origin: apiBase,
             Referer: url,
             __xfpd_withCredentials: true,
+            __xfpd_timeout: FILESTER_API_TIMEOUT_MS,
         });
 
         const safeJson = (txt) => {
@@ -5219,7 +5279,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                     'GET',
                     probeUrl,
                     { onResponseHeadersReceieved: () => {} },
-                    { Range: 'bytes=0-0', Referer: `${apiBase}/`, __xfpd_withCredentials: true },
+                    { Range: 'bytes=0-0', Referer: `${apiBase}/`, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_PROBE_TIMEOUT_MS },
                     null,
                     'text',
                 );
@@ -5261,7 +5321,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                     'GET',
                     tokenUrl,
                     {},
-                    { Range: 'bytes=0-0', Referer: ref, __xfpd_withCredentials: true },
+                    { Range: 'bytes=0-0', Referer: ref, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
                     null,
                     'text',
                 );
@@ -5284,7 +5344,7 @@ const filesterParseDispositionFilename = (headersRaw) => {
                         'GET',
                         tokenUrl,
                         {},
-                        { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', Referer: ref, __xfpd_withCredentials: true },
+                        { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', Referer: ref, __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
                         null,
                         'text',
                     );
@@ -5362,7 +5422,7 @@ try {
             'GET',
             slugPageUrl,
             {},
-            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true },
+            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
             {},
             'text',
         );
@@ -5410,7 +5470,7 @@ try {
             'GET',
             viewPageUrl,
             {},
-            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true },
+            { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', __xfpd_withCredentials: true, __xfpd_timeout: FILESTER_API_TIMEOUT_MS },
             {},
             'text',
         );
@@ -5540,19 +5600,20 @@ try {
         try {
             if (relViewPath && /^\/v\//i.test(String(relViewPath))) {
                 if (progressCB) progressCB('[Filester] Probing cache stream URL...');
-                const bases = [];
-                // Chrome Tampermonkey downloads are more reliable when starting from filester.me (redirects preserve a Filester referrer).
-                if (!isFF) bases.push(apiBase);
-                bases.push('https://cache6.filester.me');
-                for (let i = 1; i <= 8; i++) if (i !== 6) bases.push(`https://cache${i}.filester.me`);
-                if (isFF) bases.push(apiBase);
+                const bases = filesterStreamBases(apiBase);
 
                 let streamUrl = null;
                 let streamCt = '';
                 let streamSize = 0;
                 let streamHdrName = '';
 
+                // Hard budget for the whole probe sweep. These are speculative guesses at which host
+                // serves the token; the /api/public/download fallback below is authoritative and fast,
+                // so it is never worth spending minutes here.
+                const probeDeadline = Date.now() + FILESTER_PROBE_BUDGET_MS;
+
                 for (const base of bases) {
+                    if (Date.now() > probeDeadline) break;
                     const cand = String(base).replace(/\/$/, '') + String(relViewPath);
                     const p = await filesterProbe(cand);
                     if (p && p.ok) {
