@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b07
+// @version 3.21.b08
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -16,6 +16,7 @@
 // @match https://simpcity.rs/threads/*
 // @match https://simpcity.ax/threads/*
 // @match https://gofile.io/*
+// @match https://goonbox.cr/*
 // @require https://unpkg.com/@popperjs/core@2
 // @require https://unpkg.com/tippy.js@6
 // @require https://unpkg.com/file-saver@2.0.4/dist/FileSaver.min.js
@@ -565,6 +566,240 @@ const bunkrNameByUrl = new Map();
 // API's original_url 404s (post-migration, some originals are missing but the .md. thumbnail --
 // also hosted on cuckcapital.cr -- still exists).
 const goonboxThumbByUrl = new Map();
+
+// --- Goonbox same-origin API bridge -------------------------------------------------------------
+// Goonbox's API sits behind Cloudflare and requires the first-party goonbox.cr cookies. On Firefox
+// a GM_xmlhttpRequest issued from the SimpCity tab is a third-party request and does not carry
+// them, so /api/images/* and /api/albums/* answer 403. No header we can set fixes that -- the
+// cookies are not ours to send.
+//
+// The workaround (from a contributor) is to keep one inactive goonbox.cr tab. This script also runs
+// there (see the @match), where it *is* same-origin and `fetch(..., {credentials:'include'})`
+// carries the real cookies. The two tabs talk over GM storage, which is shared per-script across
+// tabs.
+//
+// The direct GM_xmlhttpRequest stays the first attempt: it still works on Chrome/Tampermonkey and
+// costs a single request. The tab is only opened when that first attempt comes back 403, empty, or
+// unparseable, so nothing changes for users who were never affected.
+const GOONBOX_ORIGIN = 'https://goonbox.cr';
+
+const GBX_K_READY = 'xfpd_gbx_ready';
+const GBX_K_REQ = 'xfpd_gbx_req';
+const GBX_K_RES = 'xfpd_gbx_res';
+
+const GBX_POLL_MS = 150;
+const GBX_HEARTBEAT_MS = 1000;
+const GBX_READY_TIMEOUT_MS = 20000;
+const GBX_REQ_TIMEOUT_MS = 25000;
+// Close a few seconds after the *last* request, not after each one: a post usually resolves several
+// Goonbox links, and reopening a tab per link would be slow and conspicuous.
+const GBX_IDLE_CLOSE_MS = 5000;
+
+// Only these two API shapes may cross the bridge. The helper tab builds the final URL itself as
+// GOONBOX_ORIGIN + path and never accepts a full URL, so an unexpected value in GM storage cannot
+// turn a cookie-bearing tab into a general-purpose authenticated proxy. Enforced on both sides.
+const GBX_ALLOWED_PATHS = [
+    /^\/api\/images\/[A-Za-z0-9_-]{1,64}$/,
+    /^\/api\/albums\/[A-Za-z0-9._~-]{1,128}\/images\?page=\d{1,4}$/,
+];
+
+function goonboxBridgePathAllowed(p) {
+    const s = String(p || '');
+    return GBX_ALLOWED_PATHS.some(rx => rx.test(s));
+}
+
+const gbxSleep = ms => new Promise(r => setTimeout(r, ms));
+
+function gbxGet(key, dflt = '') {
+    try { return GM_getValue(key, dflt); } catch (e) { return dflt; }
+}
+
+function gbxSet(key, val) {
+    try { GM_setValue(key, val); } catch (e) {}
+}
+
+// --- requester side (runs in the SimpCity tab) ---
+let gbxTabHandle = null;
+let gbxIdleTimer = null;
+let gbxChain = Promise.resolve();
+let gbxSeq = 0;
+// Circuit breaker. If the helper tab never announces itself -- almost always a Cloudflare
+// interstitial that needs a human -- every later link would otherwise pay the full readiness
+// timeout again, since the tab handle exists and so is never reopened. A five-page album would
+// stall for minutes to produce nothing. Back off instead, but not permanently: the user may well
+// go and clear the interstitial in the tab we just opened for them.
+let gbxUnavailableUntil = 0;
+const GBX_BREAKER_MS = 120000;
+
+// The helper tab heartbeats while it is alive, so a stale value from a previous session (browser
+// closed, tab killed) reads as dead rather than wedging the next run.
+function gbxBridgeAlive() {
+    const t = Number(gbxGet(GBX_K_READY, 0) || 0) || 0;
+    return t > 0 && (Date.now() - t) < (GBX_HEARTBEAT_MS * 5);
+}
+
+function gbxCloseTab() {
+    try { if (gbxIdleTimer) clearTimeout(gbxIdleTimer); } catch (e) {}
+    gbxIdleTimer = null;
+    // window.close() from inside the tab is unreliable on Chrome; close via the GM_openInTab
+    // handle instead (xfpdCloseTabHandle also copes with implementations returning Promise<Tab>).
+    try { xfpdCloseTabHandle(gbxTabHandle); } catch (e) {}
+    gbxTabHandle = null;
+    gbxSet(GBX_K_READY, 0);
+    gbxSet(GBX_K_REQ, '');
+    gbxSet(GBX_K_RES, '');
+}
+
+function gbxTouchIdleTimer() {
+    try { if (gbxIdleTimer) clearTimeout(gbxIdleTimer); } catch (e) {}
+    gbxIdleTimer = setTimeout(() => { try { gbxCloseTab(); } catch (e) {} }, GBX_IDLE_CLOSE_MS);
+}
+
+async function gbxEnsureTab() {
+    if (gbxBridgeAlive()) {
+        gbxUnavailableUntil = 0;
+        return true;
+    }
+    if (Date.now() < gbxUnavailableUntil) return false;
+
+    if (!gbxTabHandle) {
+        gbxSet(GBX_K_READY, 0);
+        try {
+            gbxTabHandle = GM_openInTab(`${GOONBOX_ORIGIN}/`, { active: false, insert: true, setParent: true });
+        } catch (e) {
+            gbxTabHandle = null;
+            return false;
+        }
+    }
+
+    const deadline = Date.now() + GBX_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        if (gbxBridgeAlive()) {
+            gbxUnavailableUntil = 0;
+            return true;
+        }
+        await gbxSleep(GBX_POLL_MS);
+    }
+
+    // Tab never announced itself -- a Cloudflare interstitial that needs a human, most likely.
+    // Leave it open: it is where the user solves the challenge, and the next attempt after the
+    // backoff will find it alive.
+    gbxUnavailableUntil = Date.now() + GBX_BREAKER_MS;
+    return false;
+}
+
+// Sends one API path through the helper tab. Serialized: exactly one bridge request is in flight at
+// a time, which keeps the handshake race-free (a shared queue would need a read-modify-write on a
+// single GM key) and keeps the Goonbox API calls sequential. Resolves to {ok, status, body} or null.
+function goonboxBridgeGet(path) {
+    const run = async () => {
+        if (!goonboxBridgePathAllowed(path)) return null;
+        if (!(await gbxEnsureTab())) return null;
+
+        const id = `${Date.now()}_${++gbxSeq}`;
+        gbxSet(GBX_K_RES, '');
+        gbxSet(GBX_K_REQ, JSON.stringify({ id, path, t: Date.now() }));
+
+        const deadline = Date.now() + GBX_REQ_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            await gbxSleep(GBX_POLL_MS);
+
+            let res = null;
+            try { res = JSON.parse(String(gbxGet(GBX_K_RES, '') || '')); } catch (e) { res = null; }
+            if (res && res.id === id) return res;
+
+            // Tab was closed or crashed mid-request; no point waiting out the full deadline.
+            if (!gbxBridgeAlive()) break;
+        }
+        return null;
+    };
+
+    gbxChain = gbxChain.catch(() => {}).then(run);
+    const p = gbxChain;
+    p.then(() => gbxTouchIdleTimer(), () => gbxTouchIdleTimer());
+    return p;
+}
+
+// One Goonbox API call: direct first, bridge second. Returns parsed JSON, or null if both failed.
+async function goonboxApiJson(http, path, referer) {
+    const parse = (s) => {
+        try {
+            const j = JSON.parse(String(s || ''));
+            return (j && typeof j === 'object') ? j : null;
+        } catch (e) { return null; }
+    };
+
+    let status = 0;
+    let source = '';
+    try {
+        const r = await http.get(
+            `${GOONBOX_ORIGIN}${path}`,
+            {},
+            { Referer: referer || `${GOONBOX_ORIGIN}/`, Accept: 'application/json' },
+            'text',
+        );
+        status = Number((r && r.status) || 0) || 0;
+        source = String((r && r.source) || '');
+    } catch (e) {}
+
+    const direct = (status && status < 400) ? parse(source) : null;
+    if (direct) return direct;
+
+    // 403 from Cloudflare, an empty body, or an HTML challenge page that will not parse as JSON --
+    // all mean the same thing here, so retry same-origin rather than trying to tell them apart.
+    const viaBridge = await goonboxBridgeGet(path);
+    if (viaBridge && viaBridge.ok) {
+        const j = parse(viaBridge.body);
+        if (j) return j;
+    }
+
+    return null;
+}
+
+// --- helper-tab side (runs only on goonbox.cr) ---
+function goonboxBridgeServe() {
+    let lastId = '';
+    let busy = false;
+
+    const beat = () => gbxSet(GBX_K_READY, Date.now());
+    beat();
+    setInterval(beat, GBX_HEARTBEAT_MS);
+
+    setInterval(async () => {
+        if (busy) return;
+
+        let req = null;
+        try { req = JSON.parse(String(gbxGet(GBX_K_REQ, '') || '')); } catch (e) { req = null; }
+        if (!req || !req.id || req.id === lastId) return;
+
+        lastId = req.id;
+        busy = true;
+
+        const reply = (payload) => {
+            try { gbxSet(GBX_K_RES, JSON.stringify({ id: req.id, ...payload })); } catch (e) {}
+        };
+
+        try {
+            // Re-check here and not only on the requesting side: this tab is the one holding the
+            // cookies, so it is the only place the restriction actually protects anything.
+            if (!goonboxBridgePathAllowed(req.path)) {
+                reply({ ok: false, status: 0, body: '' });
+                return;
+            }
+
+            const r = await fetch(`${GOONBOX_ORIGIN}${req.path}`, {
+                credentials: 'include',
+                headers: { Accept: 'application/json' },
+            });
+            const body = await r.text();
+            reply({ ok: !!r.ok, status: Number(r.status) || 0, body });
+        } catch (e) {
+            reply({ ok: false, status: 0, body: '' });
+        } finally {
+            busy = false;
+        }
+    }, GBX_POLL_MS);
+}
 
 
 // Bunkr/Cloudflare: best-effort warm-up to let the browser complete a JS-only CF interstitial ("Just a moment...").
@@ -2518,19 +2753,10 @@ const resolvers = [
             const id = url.split('/').pop().split('?')[0];
             const fallback = goonboxThumbByUrl.get(url.replace(/\?.*/, '').replace(/\/$/, '')) || null;
 
-            const { source } = await http.get(
-                `https://goonbox.cr/api/images/${id}`,
-                {},
-                { Referer: url, Accept: 'application/json' },
-                'text',
-            );
-
-            let originalUrl = null;
-            if (source) {
-                try {
-                    originalUrl = JSON.parse(source)?.image?.original_url || null;
-                } catch (e) {}
-            }
+            // Direct request first, same-origin bridge tab only if Cloudflare rejects it -- see
+            // goonboxApiJson.
+            const data = await goonboxApiJson(http, `/api/images/${id}`, url);
+            const originalUrl = data?.image?.original_url || null;
 
             if (!originalUrl) return fallback;
 
@@ -2553,20 +2779,10 @@ const resolvers = [
         async (url, http) => {
             const albumSlug = url.replace(/\?.*/, '').split('/').filter(Boolean).pop();
 
-            const fetchPage = async page => {
-                const { source } = await http.get(
-                    `https://goonbox.cr/api/albums/${albumSlug}/images?page=${page}`,
-                    {},
-                    { Referer: url, Accept: 'application/json' },
-                    'text',
-                );
-                if (!source) return null;
-                try {
-                    return JSON.parse(source);
-                } catch (e) {
-                    return null;
-                }
-            };
+            // Direct request first, same-origin bridge tab only if Cloudflare rejects it -- see
+            // goonboxApiJson. The helper tab is reused across every page of the album.
+            const fetchPage = async page =>
+            await goonboxApiJson(http, `/api/albums/${albumSlug}/images?page=${page}`, url);
 
             const first = await fetchPage(1);
             if (!first || !h.isArray(first.images)) return null;
@@ -8506,6 +8722,18 @@ const selectedPosts = [];
     // there, so bail out immediately rather than doing pointless work (redgifs token fetch,
     // style injection) on GoFile's own pages.
     try { if (/(^|\.)gofile\.io$/i.test(location.hostname)) return; } catch (e) {}
+
+    // Same deal for goonbox.cr, except this tab has a job to do: it is the helper tab opened by
+    // goonboxBridgeGet, and it is the only context where fetch() carries Goonbox's first-party
+    // cookies. Serve the bridge, then bail out of the forum-post logic exactly as above. Users who
+    // simply browse goonbox.cr also land here -- the bridge just idles, waiting for a request that
+    // never comes, until the tab is closed.
+    try {
+        if (/(^|\.)goonbox\.cr$/i.test(location.hostname)) {
+            try { goonboxBridgeServe(); } catch (e) {}
+            return;
+        }
+    } catch (e) {}
 
     window.addEventListener('beforeunload', e => {
         if (processing.find(p => p.processing)) {
