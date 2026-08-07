@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm10
+// @version 3.21.vm11
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -321,6 +321,24 @@ const JSZip = window.JSZip;
 const tippy = window.tippy;
 const http = xfpdGM_xmlhttpRequest;
 window.isFF = typeof InstallTrigger !== 'undefined';
+
+// Script version, logged once per post run so a pasted log identifies its own build. Test reports
+// were previously ambiguous about which version produced them, which is a bad way to lose an
+// afternoon. GM_info needs no @grant in either manager, but read it defensively through the same
+// fallback shape as the xfpdGM_* ladder above -- a missing value here must never break a download.
+const xfpdVersion = (() => {
+    try {
+        const info =
+            (typeof GM_info !== 'undefined' && GM_info) ||
+            (typeof window !== 'undefined' && window.GM_info) ||
+            (xfpdGMApi && xfpdGMApi.info) ||
+            null;
+        const v = info && info.script && info.script.version;
+        return v ? String(v) : 'unknown';
+    } catch (e) {
+        return 'unknown';
+    }
+})();
 
 // --- Violentmonkey build: capability layer -----------------------------------------------
 // Measured 2026-07-28 across TM/VM x Chrome/Firefox x native/browser download modes.
@@ -6657,6 +6675,7 @@ const downloadPost = async (parsedPost, parsedHosts, enabledHostsCB, resolvers, 
     log.post.info(postId, `::Using ${enabledHosts.length} host(s)::: ${enabledHosts.map(h => h.name).join(', ')}`, postNumber);
 
     log.separator(postId);
+    log.post.info(postId, `::Script version::: ${xfpdVersion}`, postNumber);
     log.post.info(postId, `::Preparing download::`, postNumber);
 
     let completed = 0;

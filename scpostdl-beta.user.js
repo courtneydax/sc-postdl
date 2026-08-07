@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b10
+// @version 3.21.b11
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -157,6 +157,24 @@ const tippy = window.tippy;
 const http = window.GM_xmlhttpRequest;
 window.isFF = typeof InstallTrigger !== 'undefined';
 window.logs = [];
+
+// Script version, logged once per post run so a pasted log identifies its own build. Test reports
+// were previously ambiguous about which version produced them, which is a bad way to lose an
+// afternoon. GM_info needs no @grant in either manager, but read it defensively through the same
+// fallback shape used elsewhere -- a missing value here must never break a download.
+const xfpdVersion = (() => {
+    try {
+        const info =
+            (typeof GM_info !== 'undefined' && GM_info) ||
+            (typeof window !== 'undefined' && window.GM_info) ||
+            (typeof GM === 'object' && GM && GM.info) ||
+            null;
+        const v = info && info.script && info.script.version;
+        return v ? String(v) : 'unknown';
+    } catch (e) {
+        return 'unknown';
+    }
+})();
 
 const log = {
     /**
@@ -6352,6 +6370,7 @@ const downloadPost = async (parsedPost, parsedHosts, enabledHostsCB, resolvers, 
     log.post.info(postId, `::Using ${enabledHosts.length} host(s)::: ${enabledHosts.map(h => h.name).join(', ')}`, postNumber);
 
     log.separator(postId);
+    log.post.info(postId, `::Script version::: ${xfpdVersion}`, postNumber);
     log.post.info(postId, `::Preparing download::`, postNumber);
 
     let completed = 0;
