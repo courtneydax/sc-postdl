@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm09
+// @version 3.21.vm10
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -3172,25 +3172,78 @@ const resolvers = [
     [[/kemono.cr\/data/], url => url],
     [
         [/goonbox\.cr\/img\//],
-        async (url, http) => {
+        async (url, http, spoilers, postId) => {
             const id = url.split('/').pop().split('?')[0];
             const fallback = goonboxThumbByUrl.get(url.replace(/\?.*/, '').replace(/\/$/, '')) || null;
 
             // Direct request first, same-origin bridge tab only if Cloudflare rejects it -- see
             // goonboxApiJson.
             const data = await goonboxApiJson(http, `/api/images/${id}`, url);
-            const originalUrl = data?.image?.original_url || null;
 
-            if (!originalUrl) return fallback;
-
-            // Post-migration, some "original_url" targets 404 even though the medium-res thumbnail
-            // on the same cuckcapital.cr host still exists. Verify before trusting it.
-            try {
-                const check = await http.base('HEAD', originalUrl, {}, { Referer: url }, null, 'text');
-                if (!check.status || check.status >= 400) {
-                    return fallback || originalUrl;
+            // Take the first original_url anywhere in the response rather than pinning to
+            // data.image.original_url. That pin yields undefined the moment Goonbox moves the
+            // field, and the only symptom is a silently lower-resolution file -- observed
+            // 2026-08-06, where the album endpoint (images[].original_url) returned full-res
+            // originals for the very same images this path was quietly downgrading.
+            const findOriginal = (obj, depth = 0) => {
+                if (!obj || typeof obj !== 'object' || depth > 6) return null;
+                if (Array.isArray(obj)) {
+                    for (const it of obj) {
+                        const v = findOriginal(it, depth + 1);
+                        if (v) return v;
+                    }
+                    return null;
                 }
-            } catch (e) {
+                for (const k of ['original_url', 'originalUrl', 'original']) {
+                    const v = obj[k];
+                    if (typeof v === 'string' && /^https?:\/\//i.test(v.trim())) return v.trim();
+                }
+                for (const k of Object.keys(obj)) {
+                    const v = findOriginal(obj[k], depth + 1);
+                    if (v) return v;
+                }
+                return null;
+            };
+
+            const originalUrl = findOriginal(data);
+
+            if (!originalUrl) {
+                // Silent downgrade to a thumbnail is the worst failure mode here, so say so.
+                try {
+                    log.host.info(postId, `::No original_url in API response -> thumbnail::: ${url}`, 'goonbox.cr');
+                } catch (e) {}
+                return fallback;
+            }
+
+            // Post-migration, some "original_url" targets genuinely 404 even though the medium-res
+            // thumbnail on the same cuckcapital.cr host still exists, so the original is worth
+            // verifying. But only a definitive "gone" justifies discarding it: a HEAD that is
+            // refused outright (0 / 403 / 405) says nothing about whether the file is there --
+            // plenty of CDN edges simply do not serve HEAD -- and treating that as absent throws
+            // away a perfectly good original. Confirm with a ranged GET before falling back.
+            const probe = async (method, headers) => {
+                try {
+                    const r = await http.base(method, originalUrl, {}, { Referer: url, ...headers }, null, 'text');
+                    return Number((r && r.status) || 0) || 0;
+                } catch (e) {
+                    return 0;
+                }
+            };
+
+            let status = await probe('HEAD', {});
+            let reachable = status >= 200 && status < 400;
+
+            if (!reachable) {
+                // A refused HEAD is not evidence of absence, so let the ranged GET be the
+                // authority: it is the same method the download itself will use.
+                status = await probe('GET', { Range: 'bytes=0-0' });
+                reachable = status >= 200 && status < 400;
+            }
+
+            if (!reachable) {
+                try {
+                    log.host.info(postId, `::Original unreachable (${status}) -> thumbnail::: ${originalUrl}`, 'goonbox.cr');
+                } catch (e) {}
                 return fallback || originalUrl;
             }
 
