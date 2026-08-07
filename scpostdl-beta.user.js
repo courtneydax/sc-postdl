@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b08
+// @version 3.21.b09
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -17,6 +17,7 @@
 // @match https://simpcity.ax/threads/*
 // @match https://gofile.io/*
 // @match https://goonbox.cr/*
+// @match https://*.goonbox.cr/*
 // @require https://unpkg.com/@popperjs/core@2
 // @require https://unpkg.com/tippy.js@6
 // @require https://unpkg.com/file-saver@2.0.4/dist/FileSaver.min.js
@@ -594,6 +595,27 @@ const GBX_REQ_TIMEOUT_MS = 25000;
 // Close a few seconds after the *last* request, not after each one: a post usually resolves several
 // Goonbox links, and reopening a tab per link would be slow and conspicuous.
 const GBX_IDLE_CLOSE_MS = 5000;
+// Cloudflare may still be settling when the helper tab first runs, so a single same-origin attempt
+// is not enough to conclude anything.
+const GBX_FETCH_ATTEMPTS = 3;
+const GBX_FETCH_RETRY_MS = 800;
+
+// The helper tab is opened on a *real* Goonbox page (the image or album being resolved) with this
+// marker appended, rather than on the bare origin.
+//
+// Two reasons, both from contributor testing of b08. First, empirical: on Firefox + Tampermonkey a
+// tab opened at `https://goonbox.cr/` never ran this script at all -- no heartbeat ever arrived, so
+// every resolve ate the full 20s readiness timeout and then failed. Opening the actual content URL
+// works. The most likely mechanism is that the bare origin redirects somewhere the @match does not
+// cover (`www.`, most plausibly), so the script is never injected; hence the added wildcard @match
+// as well. Chrome + Tampermonkey and Firefox + Violentmonkey were unaffected, which is why b08
+// tested clean everywhere else.
+//
+// Second, the marker gates the worker: only a tab we opened serves the bridge. A user browsing
+// goonbox.cr normally no longer becomes an unwitting bridge, and `gbxBridgeAlive()` now reflects
+// only our own helper tab, which makes readiness mean one specific thing instead of two.
+const GBX_MARKER_KEY = 'xfpd_gbx';
+const GBX_MARKER_VAL = '1';
 
 // Only these two API shapes may cross the bridge. The helper tab builds the final URL itself as
 // GOONBOX_ORIGIN + path and never accepts a full URL, so an unexpected value in GM storage cannot
@@ -629,6 +651,7 @@ let gbxSeq = 0;
 // stall for minutes to produce nothing. Back off instead, but not permanently: the user may well
 // go and clear the interstitial in the tab we just opened for them.
 let gbxUnavailableUntil = 0;
+let gbxInFlight = 0;
 const GBX_BREAKER_MS = 120000;
 
 // The helper tab heartbeats while it is alive, so a stale value from a previous session (browser
@@ -650,12 +673,58 @@ function gbxCloseTab() {
     gbxSet(GBX_K_RES, '');
 }
 
-function gbxTouchIdleTimer() {
+// The idle timer must be cancelled when a request *starts*, not only re-armed when one finishes.
+// In b08 it was armed on settle only, so the 5s timer left by request N could fire in the middle of
+// request N+1 and close the tab out from under it -- the in-flight request then saw a dead bridge
+// and returned null. Back-to-back album pages usually finished inside the 5s window and hid it, but
+// any request slower than that (or one that had to wait out a tab reopen) hit it.
+function gbxCancelIdleTimer() {
     try { if (gbxIdleTimer) clearTimeout(gbxIdleTimer); } catch (e) {}
+    gbxIdleTimer = null;
+}
+
+function gbxMaybeArmIdleTimer() {
+    gbxCancelIdleTimer();
+    // Only once nothing is outstanding. gbxInFlight is a counter rather than a boolean so this
+    // stays correct if the serialization above is ever relaxed.
+    if (gbxInFlight > 0) return;
     gbxIdleTimer = setTimeout(() => { try { gbxCloseTab(); } catch (e) {} }, GBX_IDLE_CLOSE_MS);
 }
 
-async function gbxEnsureTab() {
+// A real Goonbox URL plus the marker that tells the injected script to serve the bridge.
+function gbxHelperUrl(pageUrl) {
+    const base = String(pageUrl || '').trim();
+    try {
+        const u = new URL(base);
+        if (/(^|\.)goonbox\.cr$/i.test(u.hostname)) {
+            u.searchParams.set(GBX_MARKER_KEY, GBX_MARKER_VAL);
+            return u.href;
+        }
+    } catch (e) {}
+    // No usable content URL -- fall back to the origin. Known not to work on Firefox +
+    // Tampermonkey (see GBX_MARKER_KEY), but better than not trying.
+    return `${GOONBOX_ORIGIN}/?${GBX_MARKER_KEY}=${GBX_MARKER_VAL}`;
+}
+
+function gbxOpenTab(pageUrl) {
+    gbxSet(GBX_K_READY, 0);
+    try {
+        return GM_openInTab(gbxHelperUrl(pageUrl), { active: false, insert: true, setParent: true });
+    } catch (e) {
+        return null;
+    }
+}
+
+async function gbxAwaitReady() {
+    const deadline = Date.now() + GBX_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        if (gbxBridgeAlive()) return true;
+        await gbxSleep(GBX_POLL_MS);
+    }
+    return false;
+}
+
+async function gbxEnsureTab(pageUrl) {
     if (gbxBridgeAlive()) {
         gbxUnavailableUntil = 0;
         return true;
@@ -663,26 +732,27 @@ async function gbxEnsureTab() {
     if (Date.now() < gbxUnavailableUntil) return false;
 
     if (!gbxTabHandle) {
-        gbxSet(GBX_K_READY, 0);
-        try {
-            gbxTabHandle = GM_openInTab(`${GOONBOX_ORIGIN}/`, { active: false, insert: true, setParent: true });
-        } catch (e) {
-            gbxTabHandle = null;
-            return false;
-        }
+        gbxTabHandle = gbxOpenTab(pageUrl);
+        if (!gbxTabHandle) return false;
     }
 
-    const deadline = Date.now() + GBX_READY_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-        if (gbxBridgeAlive()) {
-            gbxUnavailableUntil = 0;
-            return true;
-        }
-        await gbxSleep(GBX_POLL_MS);
+    if (await gbxAwaitReady()) {
+        gbxUnavailableUntil = 0;
+        return true;
     }
 
-    // Tab never announced itself -- a Cloudflare interstitial that needs a human, most likely.
-    // Leave it open: it is where the user solves the challenge, and the next attempt after the
+    // No heartbeat. The tab may exist but have had no script injected into it, in which case it
+    // will never come good on its own and waiting longer is pointless -- discard it and open a
+    // fresh one once. (Contributor's suggestion, from hitting exactly this on Firefox + TM.)
+    try { xfpdCloseTabHandle(gbxTabHandle); } catch (e) {}
+    gbxTabHandle = gbxOpenTab(pageUrl);
+    if (gbxTabHandle && await gbxAwaitReady()) {
+        gbxUnavailableUntil = 0;
+        return true;
+    }
+
+    // Still nothing after a clean retry: most likely a Cloudflare interstitial that needs a human.
+    // Leave this second tab open -- it is where they would solve it, and the next attempt after the
     // backoff will find it alive.
     gbxUnavailableUntil = Date.now() + GBX_BREAKER_MS;
     return false;
@@ -691,10 +761,10 @@ async function gbxEnsureTab() {
 // Sends one API path through the helper tab. Serialized: exactly one bridge request is in flight at
 // a time, which keeps the handshake race-free (a shared queue would need a read-modify-write on a
 // single GM key) and keeps the Goonbox API calls sequential. Resolves to {ok, status, body} or null.
-function goonboxBridgeGet(path) {
+function goonboxBridgeGet(path, pageUrl) {
     const run = async () => {
         if (!goonboxBridgePathAllowed(path)) return null;
-        if (!(await gbxEnsureTab())) return null;
+        if (!(await gbxEnsureTab(pageUrl))) return null;
 
         const id = `${Date.now()}_${++gbxSeq}`;
         gbxSet(GBX_K_RES, '');
@@ -714,14 +784,29 @@ function goonboxBridgeGet(path) {
         return null;
     };
 
+    // Count in, cancel any pending close, run, count out, then re-arm only if nothing else is
+    // outstanding. Incrementing here rather than inside run() is deliberate: the request is queued
+    // from this moment, so the tab must survive until the chain drains, not just until the
+    // currently-executing run() returns.
+    gbxInFlight++;
+    gbxCancelIdleTimer();
+
+    const settle = () => {
+        gbxInFlight = Math.max(0, gbxInFlight - 1);
+        gbxMaybeArmIdleTimer();
+    };
+
     gbxChain = gbxChain.catch(() => {}).then(run);
     const p = gbxChain;
-    p.then(() => gbxTouchIdleTimer(), () => gbxTouchIdleTimer());
+    p.then(settle, settle);
     return p;
 }
 
 // One Goonbox API call: direct first, bridge second. Returns parsed JSON, or null if both failed.
-async function goonboxApiJson(http, path, referer) {
+// `pageUrl` is the real Goonbox page being resolved: it is both the Referer for the direct request
+// and, with a marker appended, the URL the helper tab is opened on.
+async function goonboxApiJson(http, path, pageUrl) {
+    const referer = pageUrl;
     const parse = (s) => {
         try {
             const j = JSON.parse(String(s || ''));
@@ -747,7 +832,7 @@ async function goonboxApiJson(http, path, referer) {
 
     // 403 from Cloudflare, an empty body, or an HTML challenge page that will not parse as JSON --
     // all mean the same thing here, so retry same-origin rather than trying to tell them apart.
-    const viaBridge = await goonboxBridgeGet(path);
+    const viaBridge = await goonboxBridgeGet(path, pageUrl);
     if (viaBridge && viaBridge.ok) {
         const j = parse(viaBridge.body);
         if (j) return j;
@@ -757,7 +842,20 @@ async function goonboxApiJson(http, path, referer) {
 }
 
 // --- helper-tab side (runs only on goonbox.cr) ---
+// Only serves in a tab *we* opened, identified by the marker in the URL. A user browsing
+// goonbox.cr normally runs this script too (the @match is origin-wide) but must not silently
+// become a bridge for it.
+function gbxIsHelperTab() {
+    try {
+        return new URLSearchParams(location.search).get(GBX_MARKER_KEY) === GBX_MARKER_VAL;
+    } catch (e) {
+        return false;
+    }
+}
+
 function goonboxBridgeServe() {
+    if (!gbxIsHelperTab()) return;
+
     let lastId = '';
     let busy = false;
 
@@ -787,12 +885,32 @@ function goonboxBridgeServe() {
                 return;
             }
 
-            const r = await fetch(`${GOONBOX_ORIGIN}${req.path}`, {
-                credentials: 'include',
-                headers: { Accept: 'application/json' },
-            });
-            const body = await r.text();
-            reply({ ok: !!r.ok, status: Number(r.status) || 0, body });
+            // Cloudflare may still be settling in a tab that has only just loaded, so a single
+            // attempt is not enough to conclude the cookies are unusable. Retry a few times, but
+            // only while the answer still looks like a challenge or a transport failure -- a clean
+            // 404 is a real answer and is returned immediately.
+            let last = { ok: false, status: 0, body: '' };
+            for (let attempt = 1; attempt <= GBX_FETCH_ATTEMPTS; attempt++) {
+                try {
+                    const r = await fetch(`${GOONBOX_ORIGIN}${req.path}`, {
+                        credentials: 'include',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const body = await r.text();
+                    last = { ok: !!r.ok, status: Number(r.status) || 0, body };
+                } catch (e) {
+                    last = { ok: false, status: 0, body: '' };
+                }
+
+                let parsed = null;
+                try { parsed = JSON.parse(String(last.body || '')); } catch (e) { parsed = null; }
+                if (last.ok && parsed && typeof parsed === 'object') break;
+                if (last.status && last.status !== 403 && last.status !== 429 && last.status < 500) break;
+
+                if (attempt < GBX_FETCH_ATTEMPTS) await gbxSleep(GBX_FETCH_RETRY_MS);
+            }
+
+            reply(last);
         } catch (e) {
             reply({ ok: false, status: 0, body: '' });
         } finally {
