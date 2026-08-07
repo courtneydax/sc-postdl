@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b13
+// @version 3.21.b14
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -127,6 +127,7 @@
 // @grant GM_download
 // @grant GM_setValue
 // @grant GM_getValue
+// @grant GM_addValueChangeListener
 // @grant GM_log
 // @grant GM_openInTab
 // @grant GM_cookie
@@ -648,6 +649,44 @@ function goonboxBridgePathAllowed(p) {
     return GBX_ALLOWED_PATHS.some(rx => rx.test(s));
 }
 
+// --- cross-tab delivery ---------------------------------------------------------------------
+// GM storage reads are NOT reliably cross-tab. Tampermonkey keeps a per-tab in-memory cache, and
+// GM_getValue reads that cache -- so a tab polling for another tab's write can sit reading its own
+// stale copy indefinitely. That is exactly what stalled the bridge on Firefox + Tampermonkey
+// (b13): the helper tab heartbeated correctly and the script was confirmed running in it, while
+// the SimpCity tab polled its own cache, saw nothing, and timed out after two 20s waits. Chrome +
+// TM and Firefox + VM happen to propagate, which is why it worked there and hid the assumption.
+//
+// GM_addValueChangeListener is the documented mechanism for this: the callback is handed newValue
+// directly, so no cache is ever consulted. Polling is **kept alongside** it rather than replaced --
+// it demonstrably works on the configurations that already worked, and the two paths dedupe
+// naturally (by request id, and by taking whichever heartbeat is newer), so whichever arrives
+// first wins and neither can double-handle a request.
+const xfpdAddValueChangeListener =
+    (typeof GM_addValueChangeListener === 'function' ? GM_addValueChangeListener : null) ||
+    (typeof window.GM_addValueChangeListener === 'function' ? window.GM_addValueChangeListener.bind(window) : null);
+
+// Mirrors fed by the listener, consulted alongside the polled value.
+let gbxReadyMirror = 0;
+let gbxResMirror = '';
+let gbxListenersBound = false;
+
+function gbxBindListeners() {
+    if (gbxListenersBound || !xfpdAddValueChangeListener) return;
+    gbxListenersBound = true;
+    try {
+        xfpdAddValueChangeListener(GBX_K_READY, (name, oldV, newV) => {
+            // Last write wins: heartbeats are monotonic, and tab close writes 0 to clear.
+            gbxReadyMirror = Number(newV || 0) || 0;
+        });
+    } catch (e) {}
+    try {
+        xfpdAddValueChangeListener(GBX_K_RES, (name, oldV, newV) => {
+            gbxResMirror = String(newV || '');
+        });
+    } catch (e) {}
+}
+
 const gbxSleep = ms => new Promise(r => setTimeout(r, ms));
 
 function gbxGet(key, dflt = '') {
@@ -675,7 +714,10 @@ const GBX_BREAKER_MS = 120000;
 // The helper tab heartbeats while it is alive, so a stale value from a previous session (browser
 // closed, tab killed) reads as dead rather than wedging the next run.
 function gbxBridgeAlive() {
-    const t = Number(gbxGet(GBX_K_READY, 0) || 0) || 0;
+    // Whichever source is fresher. The polled read is authoritative where propagation works; the
+    // listener mirror is the only source that sees anything at all on Firefox + Tampermonkey.
+    const polled = Number(gbxGet(GBX_K_READY, 0) || 0) || 0;
+    const t = Math.max(polled, gbxReadyMirror);
     return t > 0 && (Date.now() - t) < (GBX_HEARTBEAT_MS * 5);
 }
 
@@ -743,6 +785,10 @@ async function gbxAwaitReady() {
 }
 
 async function gbxEnsureTab(pageUrl) {
+    // Must happen before the first gbxBridgeAlive() read, or the heartbeat that arrives while we
+    // are opening the tab has nowhere to land.
+    gbxBindListeners();
+
     if (gbxBridgeAlive()) {
         gbxUnavailableUntil = 0;
         return true;
@@ -785,6 +831,7 @@ function goonboxBridgeGet(path, pageUrl) {
         if (!(await gbxEnsureTab(pageUrl))) return null;
 
         const id = `${Date.now()}_${++gbxSeq}`;
+        gbxResMirror = '';
         gbxSet(GBX_K_RES, '');
         gbxSet(GBX_K_REQ, JSON.stringify({ id, path, t: Date.now() }));
 
@@ -792,9 +839,15 @@ function goonboxBridgeGet(path, pageUrl) {
         while (Date.now() < deadline) {
             await gbxSleep(GBX_POLL_MS);
 
+            // Listener mirror first -- on Firefox + Tampermonkey the polled read never updates.
             let res = null;
-            try { res = JSON.parse(String(gbxGet(GBX_K_RES, '') || '')); } catch (e) { res = null; }
-            if (res && res.id === id) return res;
+            for (const raw of [gbxResMirror, gbxGet(GBX_K_RES, '')]) {
+                try {
+                    const p = JSON.parse(String(raw || ''));
+                    if (p && p.id === id) { res = p; break; }
+                } catch (e) {}
+            }
+            if (res) return res;
 
             // Tab was closed or crashed mid-request; no point waiting out the full deadline.
             if (!gbxBridgeAlive()) break;
@@ -940,11 +993,11 @@ function goonboxBridgeServe() {
     beat();
     setInterval(beat, GBX_HEARTBEAT_MS);
 
-    setInterval(async () => {
+    const handle = async (raw) => {
         if (busy) return;
 
         let req = null;
-        try { req = JSON.parse(String(gbxGet(GBX_K_REQ, '') || '')); } catch (e) { req = null; }
+        try { req = JSON.parse(String(raw || '')); } catch (e) { req = null; }
         if (!req || !req.id || req.id === lastId) return;
 
         lastId = req.id;
@@ -993,7 +1046,19 @@ function goonboxBridgeServe() {
         } finally {
             busy = false;
         }
-    }, GBX_POLL_MS);
+    };
+
+    // Listener first: on Firefox + Tampermonkey the poll below never observes the SimpCity tab's
+    // write at all, because it only ever reads this tab's own cached copy.
+    if (xfpdAddValueChangeListener) {
+        try {
+            xfpdAddValueChangeListener(GBX_K_REQ, (name, oldV, newV) => { handle(newV); });
+        } catch (e) {}
+    }
+
+    // Polling retained deliberately: it is what works on the configurations that already worked,
+    // and `lastId` makes double-delivery a no-op.
+    setInterval(() => { handle(gbxGet(GBX_K_REQ, '')); }, GBX_POLL_MS);
 }
 
 
