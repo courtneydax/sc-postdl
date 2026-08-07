@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b11
+// @version 3.21.b12
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -820,11 +820,40 @@ function goonboxBridgeGet(path, pageUrl) {
     return p;
 }
 
+// Debug switch: force every Goonbox API call down the bridge path even when the direct request
+// succeeds. Set from the console on a SimpCity tab:
+//
+//     GM_setValue('xfpd_gbx_force_bridge', true)     // enable
+//     GM_setValue('xfpd_gbx_force_bridge', false)    // disable
+//
+// This exists because the 403 the bridge was built for has not reproduced in **any** configuration
+// across six test runs (Chrome+TM, Firefox+TM, Firefox+VM). With the direct request always
+// succeeding, not one line of the bridge executes against the real site, so the feature cannot be
+// validated by ordinary testing at all. Forcing the path exercises tab open -> marker -> same-origin
+// fetch -> handshake end to end, independently of whether the symptom reproduces.
+//
+// Off unless explicitly enabled, and it only ever *adds* an attempt -- with the flag set, a failed
+// bridge still falls through to whatever the direct call returned, so enabling it cannot make a
+// download fail that would otherwise have worked.
+const GBX_K_FORCE = 'xfpd_gbx_force_bridge';
+
+function gbxForceEnabled() {
+    try {
+        const v = gbxGet(GBX_K_FORCE, false);
+        return v === true || String(v).toLowerCase() === 'true';
+    } catch (e) {
+        return false;
+    }
+}
+
 // One Goonbox API call: direct first, bridge second. Returns parsed JSON, or null if both failed.
 // `pageUrl` is the real Goonbox page being resolved: it is both the Referer for the direct request
 // and, with a marker appended, the URL the helper tab is opened on.
-async function goonboxApiJson(http, path, pageUrl) {
+async function goonboxApiJson(http, path, pageUrl, postId) {
     const referer = pageUrl;
+    const say = (msg) => {
+        try { log.host.info(postId, msg, 'goonbox.cr'); } catch (e) {}
+    };
     const parse = (s) => {
         try {
             const j = JSON.parse(String(s || ''));
@@ -846,15 +875,35 @@ async function goonboxApiJson(http, path, pageUrl) {
     } catch (e) {}
 
     const direct = (status && status < 400) ? parse(source) : null;
-    if (direct) return direct;
+    const forced = gbxForceEnabled();
 
-    // 403 from Cloudflare, an empty body, or an HTML challenge page that will not parse as JSON --
-    // all mean the same thing here, so retry same-origin rather than trying to tell them apart.
+    if (direct && !forced) return direct;
+
+    // Whether the bridge engages has been invisible in the logs until now, which is exactly why six
+    // runs produced no usable evidence about it. Say so, and say why.
+    if (forced) {
+        say(`::Bridge forced (debug flag)::: ${path}`);
+    } else {
+        // 403 from Cloudflare, an empty body, or an HTML challenge page that will not parse as JSON
+        // -- all mean the same thing here, so retry same-origin rather than telling them apart.
+        say(`::API direct failed (${status || 'no response'}) -> bridge::: ${path}`);
+    }
+
     const viaBridge = await goonboxBridgeGet(path, pageUrl);
+
     if (viaBridge && viaBridge.ok) {
         const j = parse(viaBridge.body);
-        if (j) return j;
+        if (j) {
+            say(`::Bridge OK (${viaBridge.status})::: ${path}`);
+            return j;
+        }
+        say(`::Bridge returned ${viaBridge.status} but body was not JSON::: ${path}`);
+    } else {
+        say(`::Bridge failed (${viaBridge ? viaBridge.status : 'no response'})::: ${path}`);
     }
+
+    // Forcing must never be able to break a working download: fall back to the direct result.
+    if (direct) return direct;
 
     return null;
 }
@@ -2891,7 +2940,7 @@ const resolvers = [
 
             // Direct request first, same-origin bridge tab only if Cloudflare rejects it -- see
             // goonboxApiJson.
-            const data = await goonboxApiJson(http, `/api/images/${id}`, url);
+            const data = await goonboxApiJson(http, `/api/images/${id}`, url, postId);
 
             // Take the first original_url anywhere in the response rather than pinning to
             // data.image.original_url. That pin yields undefined the moment Goonbox moves the
@@ -2965,13 +3014,13 @@ const resolvers = [
     ],
     [
         [/goonbox\.cr\/a\//],
-        async (url, http) => {
+        async (url, http, spoilers, postId) => {
             const albumSlug = url.replace(/\?.*/, '').split('/').filter(Boolean).pop();
 
             // Direct request first, same-origin bridge tab only if Cloudflare rejects it -- see
             // goonboxApiJson. The helper tab is reused across every page of the album.
             const fetchPage = async page =>
-            await goonboxApiJson(http, `/api/albums/${albumSlug}/images?page=${page}`, url);
+            await goonboxApiJson(http, `/api/albums/${albumSlug}/images?page=${page}`, url, postId);
 
             const first = await fetchPage(1);
             if (!first || !h.isArray(first.images)) return null;
