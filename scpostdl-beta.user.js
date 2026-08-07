@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b12
+// @version 3.21.b13
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -821,10 +821,16 @@ function goonboxBridgeGet(path, pageUrl) {
 }
 
 // Debug switch: force every Goonbox API call down the bridge path even when the direct request
-// succeeds. Set from the console on a SimpCity tab:
+// succeeds. From the devtools console on a SimpCity tab:
 //
-//     GM_setValue('xfpd_gbx_force_bridge', true)     // enable
-//     GM_setValue('xfpd_gbx_force_bridge', false)    // disable
+//     localStorage.setItem('xfpd_gbx_force_bridge', 'true')   // enable
+//     localStorage.removeItem('xfpd_gbx_force_bridge')        // disable
+//
+// localStorage rather than GM storage because `GM_setValue` does not exist in the page console --
+// the GM_* functions live only inside the userscript sandbox, so they cannot be called from
+// devtools. The flag is read exclusively in the SimpCity tab (the helper tab never consults it), so
+// page-origin storage is sufficient. GM storage is still honoured as well, for anyone setting it
+// through Tampermonkey's Storage tab.
 //
 // This exists because the 403 the bridge was built for has not reproduced in **any** configuration
 // across six test runs (Chrome+TM, Firefox+TM, Firefox+VM). With the direct request always
@@ -838,12 +844,16 @@ function goonboxBridgeGet(path, pageUrl) {
 const GBX_K_FORCE = 'xfpd_gbx_force_bridge';
 
 function gbxForceEnabled() {
+    // Page-origin storage first, since that is the one reachable from devtools.
+    try {
+        const v = localStorage.getItem(GBX_K_FORCE);
+        if (v !== null && String(v).toLowerCase() === 'true') return true;
+    } catch (e) {}
     try {
         const v = gbxGet(GBX_K_FORCE, false);
-        return v === true || String(v).toLowerCase() === 'true';
-    } catch (e) {
-        return false;
-    }
+        if (v === true || String(v).toLowerCase() === 'true') return true;
+    } catch (e) {}
+    return false;
 }
 
 // One Goonbox API call: direct first, bridge second. Returns parsed JSON, or null if both failed.
