@@ -5,8 +5,8 @@
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
 // @version 3.21.zvm14
-// @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
-// @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
+// @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-zvm.user.js
+// @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-zvm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
 // @license WTFPL; http://www.wtfpl.net/txt/copying/
 // @match https://simpcity.cr/threads/*
