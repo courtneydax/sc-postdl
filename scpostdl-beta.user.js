@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.21.b14
+// @version 3.21.b15
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -3890,7 +3890,9 @@ if (page === 1) {
 
         // GoFile no longer uses the static appdata.wt from config.js for /contents.
         // The website now derives a per-request X-Website-Token from the account token
-        // via generateWT() in https://gofile.io/dist/js/wt.obf.js, i.e.:
+        // via generateWT() in https://gofile.io/js/wt.obf.js (moved from /dist/js/ in a
+        // 2026-08-13 site redesign -- the old path now 404s to the SPA shell's index.html,
+        // which silently fails the /generateWT/ source check below), i.e.:
         //   WT = sha256(navigator.userAgent + "::" + navigator.language + "::" + token + "::<time>::<salt>")
         // <time> is NOT a static value -- it's Math.floor(Date.now() / 1000 / 14400) (a
         // 4-hour bucket), recomputed live inside generateWT() itself. <salt> is the one
@@ -3914,7 +3916,7 @@ if (page === 1) {
                     : null;
 
             if (!src) {
-                const { source } = await gmReq('GET', 'https://gofile.io/dist/js/wt.obf.js', null, {}, 'text');
+                const { source } = await gmReq('GET', 'https://gofile.io/js/wt.obf.js', null, {}, 'text');
                 src = source || '';
                 if (!src || !/generateWT/.test(src)) {
                     throw new Error('Could not fetch GoFile wt.obf.js (generateWT).');
