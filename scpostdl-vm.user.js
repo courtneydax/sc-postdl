@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts (Violentmonkey build — Chrome recommended; see notes at the top of the file)
-// @version 3.21.vm15
+// @version 3.21.vm16
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-vm.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -4438,14 +4438,55 @@ if (page === 1) {
 
             const resolved = [];
 
+            // Some /d/ links point directly at a file, not a folder -- /contents/{id} then
+            // returns data.type === 'file' with no data.children. Shared by the root-level
+            // case below and the folder-iteration loop, so the link-picking logic (and the
+            // filename-cache side effect) only lives in one place.
+            const resolveGofileFileLink = obj => {
+                if (!obj) return null;
+
+                const fileId = obj.id || obj.code;
+                const fileName = encodeURIComponent(obj.name || fileId || 'file');
+
+                // Prefer direct/CDN links when available. Do NOT force /download/web/
+                // (web flow can return album HTML).
+                const candidates = [obj.directLink, obj.link, obj.downloadLink].filter(Boolean);
+                const link =
+                    candidates.find(u => /\/download\/direct\//i.test(String(u))) ||
+                    candidates[0] ||
+                    (fileId ? `https://gofile.io/download/web/${fileId}/${fileName}` : null);
+
+                if (link) {
+                    // Preserve original GoFile filename (from API) so we don't rely on URL-encoded path segment.
+                    try {
+                        if (obj.name) {
+                            if (fileId) gofileNameById.set(String(fileId), String(obj.name));
+                            gofileNameByUrl.set(String(link), String(obj.name));
+                        }
+                    } catch (e) {}
+                }
+
+                return link;
+            };
+
             const getChildAlbums = async (props, spoilers) => {
-                if (!props || props.status !== 'ok' || !props.data || !props.data.children) {
+                if (!props || props.status !== 'ok' || !props.data) {
                     return [];
                 }
 
                 const resolved = [];
 
             folderName = props.data.name || folderName;
+
+                if (props.data.type === 'file') {
+                    const link = resolveGofileFileLink(props.data);
+                    if (link) resolved.push(link);
+                    return resolved;
+                }
+
+                if (!props.data.children) {
+                    return [];
+                }
 
                 const files = props.data.children;
 
@@ -4455,26 +4496,8 @@ if (page === 1) {
                 if (!obj) continue;
 
                     if (obj.type === 'file') {
-                    const fileId = obj.id || obj.code;
-                    const fileName = encodeURIComponent(obj.name || fileId || 'file');
-
-                    // Prefer direct/CDN links when available. Do NOT force /download/web/
-                    // (web flow can return album HTML).
-                    const candidates = [obj.directLink, obj.link, obj.downloadLink].filter(Boolean);
-                    let link =
-                        candidates.find(u => /\/download\/direct\//i.test(String(u))) ||
-                        candidates[0] ||
-                        (fileId ? `https://gofile.io/download/web/${fileId}/${fileName}` : null);
-
-                    if (link) {
-                        // Preserve original GoFile filename (from API) so we don't rely on URL-encoded path segment.
-                        try {
-                            if (obj.name) {
-                                if (fileId) gofileNameById.set(String(fileId), String(obj.name));
-                                if (link) gofileNameByUrl.set(String(link), String(obj.name));
-                            }
-                        } catch (e) {}resolved.push(link);
-                    }
+                        const link = resolveGofileFileLink(obj);
+                        if (link) resolved.push(link);
                 } else if (obj.type === 'folder') {
                     const folderId = obj.id || obj.code;
                     if (!folderId) continue;
