@@ -4,7 +4,7 @@
 // @namespace https://github.com/courtneydax
 // @author courtneydax
 // @description Downloads images and videos from posts
-// @version 3.23.b01
+// @version 3.23.b02
 // @updateURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @downloadURL https://github.com/courtneydax/sc-postdl/raw/main/scpostdl-beta.user.js
 // @icon https://simp4.cuckcapital.cr/simpcityIcon192.png
@@ -4411,8 +4411,27 @@ if (page === 1) {
             // Map videoId -> original filename (from album HTML)
             const idToName = new Map();
 
-            // Collect video ids (and names) from the table rows (server-rendered HTML)
-            let ids = Array.from(dom?.querySelectorAll('tr.file-row') || [])
+            // Current album pages are client-rendered: the file list is an inline
+            // `const FILES = [ { id:"..", name:"..", size:.. }, ... ];` and there are no
+            // tr.file-row / href="/v/.." elements in the served HTML. Read that array first.
+            let ids = [];
+            const filesBlock = String(source || '').match(/\bconst\s+FILES\s*=\s*\[([\s\S]*?)\n\s*\];/);
+            if (filesBlock) {
+                const entryRe = /\{\s*id\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*name\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+                let em;
+                while ((em = entryRe.exec(filesBlock[1])) !== null) {
+                    const eid = em[1];
+                    if (!eid) continue;
+                    let ename = em[2];
+                    try { ename = JSON.parse(`"${em[2]}"`); } catch (e) {}
+                    if (ename) idToName.set(eid, ename);
+                    ids.push(eid);
+                }
+                ids = ids.unique();
+            }
+
+            // Legacy layout: video ids (and names) from the table rows (server-rendered HTML)
+            if (!ids.length) ids = Array.from(dom?.querySelectorAll('tr.file-row') || [])
             .map(row => {
                 const a = row.querySelector('a[href^="/v/"]');
                 const id = (a?.getAttribute('href') || '').match(/\/v\/([^\/?#]+)/i)?.[1];
